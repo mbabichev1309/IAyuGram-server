@@ -1,0 +1,6 @@
+# This repo is deployed on Linux; keep LF everywhere regardless of dev OS.
+* text=auto eol=lf
+*.py text eol=lf
+*.service text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
