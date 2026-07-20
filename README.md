@@ -1,6 +1,6 @@
 # iayugram-server
 
-Companion capture server for [IAyuGram](../Swift/IAyuGram). A **second authorized
+Companion capture server for [IAyuGram](../client). A **second authorized
 session** of the user's own Telegram account (a userbot, running with Ghost mode
 semantics) that receives `updateDeleteMessages` / `updateEditMessage` in real time
 and is the single authoritative source of deleted / edited message content — it
