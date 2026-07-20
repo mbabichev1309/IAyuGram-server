@@ -1,0 +1,24 @@
+[project]
+name = "iayugram-server"
+version = "0.1.0"
+description = "Companion capture server for IAyuGram (deleted/edited message preservation via a 2nd Telegram session)"
+requires-python = ">=3.11"
+dependencies = [
+    "telethon>=1.36",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "aiosqlite>=0.20",
+    "cryptography>=42",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+]
+
+[project.scripts]
+iayugram-server = "iayugram_server.__main__:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

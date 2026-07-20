@@ -1,0 +1,22 @@
+# Secrets & session — NEVER commit these
+.env
+*.session
+*.session-journal
+session_string.txt
+secret.key
+
+# Data (deleted content lives here — do not commit)
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/

@@ -1,0 +1,24 @@
+[Unit]
+Description=IAyuGram companion capture server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and paths to your box:
+User=iayugram
+WorkingDirectory=/opt/iayugram-server
+EnvironmentFile=/opt/iayugram-server/.env
+ExecStart=/opt/iayugram-server/.venv/bin/python -m iayugram_server
+
+# Uptime is critical: differenceTooLong won't replay deletes missed while down.
+Restart=always
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
