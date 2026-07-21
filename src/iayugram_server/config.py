@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     api_hash: str
     session_string: str = ""
     content_key: str  # Fernet key (base64)
+    # "symmetric" (Fernet, server can read) is current. Reserved for a future
+    # "sealed" mode: encrypt at rest with the client's public key so the server
+    # operator can't read the archive — deferred until the iOS client exists to
+    # hold the private key. Per-account keys already isolate accounts either way.
+    content_key_type: str = "symmetric"
 
     host: str = "0.0.0.0"
     port: int = 8787
