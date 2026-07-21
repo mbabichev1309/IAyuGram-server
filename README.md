@@ -90,8 +90,11 @@ For a handful of accounts (you + trusted friends), run **one process per
 account** — full isolation: each gets its own session, port, database and
 encryption key, and one account's ban/flood/crash can't affect the others.
 
-Each friend generates **their own** `SESSION_STRING` on their desktop
-(`scripts/tdata_to_session.py`) and sends it to you — note a session string is
+Each friend generates **their own** `SESSION_STRING` on their desktop and sends
+it to you. Give them just `scripts/friend_extract_session.py` — it's standalone
+(only `pip install opentele`, no repo/.env needed), auto-finds their tdata, and
+prints the string to copy. (You can use `scripts/tdata_to_session.py` for your
+own account, which writes straight into `.env`.) Note a session string is
 **full access** to that account, so only do this with people who trust you as the
 operator (with symmetric keys, the operator *can* read the stored archive; a
 future "sealed" key mode would change that — see `content_key_type`).
