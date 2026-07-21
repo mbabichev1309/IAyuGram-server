@@ -84,6 +84,33 @@ Event shape (`models.py::MessageEvent`): `cursor, kind (deleted|edited), chat_id
 message_id, text, old_text, date`. For `deleted`, `text` is the pre-delete
 content; for `edited`, `text` is the new content and `old_text` the previous.
 
+## Multiple accounts (one isolated instance each)
+
+For a handful of accounts (you + trusted friends), run **one process per
+account** — full isolation: each gets its own session, port, database and
+encryption key, and one account's ban/flood/crash can't affect the others.
+
+Each friend generates **their own** `SESSION_STRING` on their desktop
+(`scripts/tdata_to_session.py`) and sends it to you — note a session string is
+**full access** to that account, so only do this with people who trust you as the
+operator (with symmetric keys, the operator *can* read the stored archive; a
+future "sealed" key mode would change that — see `content_key_type`).
+
+Onboard on the server:
+```bash
+sudo bash deploy/add-account.sh alice            # prompts for the session string
+# or:  sudo bash deploy/add-account.sh alice alice-session.txt
+```
+This picks a free port, generates a fresh `CONTENT_KEY` + `CLIENT_TOKEN`, writes a
+root-only `/etc/iayugram/alice.env`, installs the `iayugram-server@.service`
+template, and starts `iayugram-server@alice`. It prints the `host:port` + token to
+hand to that account's client. Manage with `systemctl … iayugram-server@alice`.
+
+> Remote friends: the client must reach the server. On a home box behind NAT,
+> don't port-forward plain HTTP — put it on a private tunnel (e.g. Tailscale) or
+> a TLS reverse proxy so the token and traffic are encrypted (`ws://`+token in the
+> clear is LAN-only safe).
+
 ## Deploy (Ubuntu, 24/7)
 
 ```bash
