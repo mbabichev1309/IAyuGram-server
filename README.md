@@ -32,15 +32,45 @@ truth; this repo implements it.
    ID set against a refetched slice. **Uptime is critical** — hence systemd
    `Restart=always` + pts persisted to disk.
 
-## Quick start (Ubuntu)
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-cp .env.example .env          # fill in API_ID / API_HASH / secrets
-python scripts/login.py       # interactive: produces the session string once
-python -m iayugram_server     # run capture + api together
+## Getting the session string (do this once, on a machine with Telegram Desktop)
+
+The server needs a **separate** authorized session of your account. Interactive
+login-code auth (`scripts/login.py`) is unreliable in practice: if your account
+already has an active session, Telegram delivers the code only in-app
+(`SentCodeTypeApp`) with no SMS/call fallback, and it may never arrive. So the
+supported path extracts a session from an existing **Telegram/AyuGram Desktop**
+install, with **no login code**:
+
+```powershell
+# on the desktop machine, inside this repo, with a venv that has deps installed
+#   1. fill API_ID / API_HASH / CONTENT_KEY / CLIENT_TOKEN in .env (copy .env.example)
+#   2. log Telegram/AyuGram Desktop into the target account (QR is fine)
+#   3. fully quit Telegram/AyuGram Desktop, then:
+$env:TG_2FA = "<your cloud password>"     # needed: new-session QR login triggers 2FA
+.venv\Scripts\python.exe scripts\tdata_to_session.py
+Remove-Item Env:\TG_2FA
 ```
 
-## Deploy
-See `deploy/iayugram-server.service`. Copy to `/etc/systemd/system/`,
-`systemctl enable --now iayugram-server`.
+This writes `SESSION_STRING=` into `.env` (a fresh, separate session — its own
+auth_key, so it actually receives the Updates stream). Edit `TDATA` at the top of
+`scripts/tdata_to_session.py` if your tdata folder is elsewhere.
+
+`scripts/login.py` remains for the classic code-based flow but is **not** the
+recommended path (see above).
+
+## Deploy (Ubuntu, 24/7)
+
+```bash
+git clone https://github.com/mbabichev1309/IAyuGram-server.git
+cd IAyuGram-server
+cp /path/to/your/.env .env      # transfer manually — secrets never go through git
+bash deploy/setup-ubuntu.sh     # venv + deps + renders & starts the systemd unit
+```
+
+`deploy/setup-ubuntu.sh` installs the venv, `pip install -e .`, renders
+`deploy/iayugram-server.service` with the correct paths/user into
+`/etc/systemd/system/`, and `systemctl enable --now`s it. Then:
+
+```bash
+journalctl -u iayugram-server -f     # follow logs
+```
