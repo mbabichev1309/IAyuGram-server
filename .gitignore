@@ -6,6 +6,9 @@ session_string.txt
 secret.key
 *.log
 login_debug.log
+# TLS material (e.g. left by `tailscale cert`)
+*.crt
+*.key
 
 # Data (deleted content lives here — do not commit)
 *.db
