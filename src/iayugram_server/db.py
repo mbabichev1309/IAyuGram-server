@@ -104,6 +104,38 @@ class Store:
         chat_id, body, date = row
         return chat_id, (decrypt(body) if body is not None else None), date
 
+    async def candidates_for_reconcile(
+        self, limit: int
+    ) -> list[tuple[int, int, str | None, int | None]]:
+        """Stored messages that have NO recorded delete yet — the set to verify
+        against the server on launch. Returns (chat_id, message_id, text, date),
+        newest first, capped at `limit`. A delete event may have been stored with
+        chat_id=0 (DM limitation), so match on message_id OR the exact chat."""
+        async with self.db.execute(
+            "SELECT c.chat_id, c.message_id, c.body, c.date "
+            "FROM content c "
+            "WHERE NOT EXISTS ("
+            "  SELECT 1 FROM events e "
+            "  WHERE e.kind='deleted' AND e.message_id=c.message_id "
+            "    AND (e.chat_id=c.chat_id OR e.chat_id=0)"
+            ") "
+            "ORDER BY c.seen_at DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            (r[0], r[1], decrypt(r[2]) if r[2] is not None else None, r[3])
+            for r in rows
+        ]
+
+    async def has_delete_event(self, chat_id: int, message_id: int) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM events WHERE kind='deleted' AND message_id=? "
+            "AND (chat_id=? OR chat_id=0) LIMIT 1",
+            (message_id, chat_id),
+        ) as cur:
+            return await cur.fetchone() is not None
+
     async def prune_content(self) -> int:
         cutoff = int(time.time()) - settings.content_retention_hours * 3600
         cur = await self.db.execute("DELETE FROM content WHERE seen_at < ?", (cutoff,))

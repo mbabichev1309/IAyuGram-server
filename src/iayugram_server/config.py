@@ -19,5 +19,12 @@ class Settings(BaseSettings):
     db_path: str = "data/iayugram.db"
     content_retention_hours: int = 168
 
+    # On startup, verify stored messages still exist (getMessages by ID) and emit
+    # synthetic DELETED events for any that vanished while the server was down.
+    # StringSession does not persist Telethon's update pts across restarts, so
+    # this scan is the ONLY way to recover deletes missed during downtime.
+    reconcile_on_launch: bool = True
+    reconcile_max_messages: int = 3000  # cap per launch to bound API load
+
 
 settings = Settings()  # type: ignore[call-arg]
