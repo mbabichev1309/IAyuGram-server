@@ -58,6 +58,32 @@ auth_key, so it actually receives the Updates stream). Edit `TDATA` at the top o
 `scripts/login.py` remains for the classic code-based flow but is **not** the
 recommended path (see above).
 
+## Client integration (how the phone consumes events)
+
+Two channels, both authenticated with `CLIENT_TOKEN`. Every event has a
+monotonic `cursor` — that's the whole synchronization primitive.
+
+- **REST `GET /gap-sync?since=<cursor>&limit=<n>`** (header `Authorization: Bearer <token>`)
+  → `{ events: [...], latest_cursor }`. Backfill: what happened while offline,
+  starting *after* `since`. Paginate until the last event's `cursor` reaches
+  `latest_cursor`.
+- **WebSocket `/live?token=<token>`** → pushes each new event as JSON the moment
+  it happens.
+
+**Recommended connect order (avoids a gap):**
+1. Open the WebSocket **first** and start buffering incoming events (don't apply yet).
+2. Call `/gap-sync` from your last-seen cursor, paginating to `latest_cursor`.
+3. Apply the gap-sync events, then drain the buffered live events.
+4. **Dedup by `cursor`** — drop any cursor already applied. Cursors are strictly
+   increasing and unique per server, so this makes the whole flow idempotent even
+   if backfill and live overlap.
+
+Persist the highest applied `cursor` on the client; that's your `since` next launch.
+
+Event shape (`models.py::MessageEvent`): `cursor, kind (deleted|edited), chat_id,
+message_id, text, old_text, date`. For `deleted`, `text` is the pre-delete
+content; for `edited`, `text` is the new content and `old_text` the previous.
+
 ## Deploy (Ubuntu, 24/7)
 
 ```bash
