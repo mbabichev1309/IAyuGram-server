@@ -70,11 +70,19 @@ class Capture:
 
         @self.client.on(events.MessageDeleted)
         async def _on_delete(ev: events.MessageDeleted.Event) -> None:
-            # NOTE: for DMs Telethon sometimes can't resolve chat_id here
-            # (ev.chat_id is None) — a known Telethon limitation. See docs.
-            chat_id = ev.chat_id or 0
+            # For DMs Telethon often can't resolve chat_id here (ev.chat_id is
+            # None) — a known limitation, and UpdateDeleteMessages carries only
+            # IDs. Non-channel message IDs are unique across a user's cloud
+            # dialogs, so when chat_id is unknown we resolve BOTH the chat_id and
+            # the text from the content store by message_id alone. Without this
+            # the deleted text is lost — which defeats the whole feature.
             for mid in ev.deleted_ids:
-                text, date = await store.get_content(chat_id, mid)
+                if ev.chat_id:
+                    chat_id = ev.chat_id
+                    text, date = await store.get_content(chat_id, mid)
+                else:
+                    chat_id, text, date = await store.resolve_by_mid(mid)
+                    chat_id = chat_id or 0
                 cursor = await store.append_event(
                     EventKind.DELETED, chat_id, mid, text, None, date
                 )
@@ -107,6 +115,12 @@ class Capture:
             )
         self._register_handlers()
         await self._reconcile_on_launch()
+        me = await self.client.get_me()
+        log.info("capture authorized as id=%s; catching up on updates", getattr(me, "id", "?"))
+        try:
+            await self.client.catch_up()
+        except Exception as e:  # noqa: BLE001
+            log.warning("catch_up failed: %s", e)
         log.info("capture running; listening for deletes/edits")
 
         while True:

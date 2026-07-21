@@ -10,6 +10,7 @@ Three responsibilities, one file so a home-server backup is a single copy:
 """
 from __future__ import annotations
 
+import os
 import time
 
 import aiosqlite
@@ -50,6 +51,10 @@ class Store:
         self._db: aiosqlite.Connection | None = None
 
     async def open(self) -> None:
+        # sqlite won't create the parent dir (e.g. data/); ensure it exists.
+        parent = os.path.dirname(self._path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self._db = await aiosqlite.connect(self._path)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(_SCHEMA)
@@ -82,6 +87,22 @@ class Store:
         if not row or row[0] is None:
             return None, (row[1] if row else None)
         return decrypt(row[0]), row[1]
+
+    async def resolve_by_mid(self, message_id: int) -> tuple[int | None, str | None, int | None]:
+        """Look up content by message_id alone — for DM/cloud-chat deletes where
+        Telethon can't give us chat_id (UpdateDeleteMessages carries only IDs, and
+        non-channel message IDs are unique across all of a user's cloud dialogs).
+        Returns (chat_id, text, date) or (None, None, None) if unknown."""
+        async with self.db.execute(
+            "SELECT chat_id, body, date FROM content WHERE message_id=? "
+            "ORDER BY seen_at DESC LIMIT 1",
+            (message_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None, None, None
+        chat_id, body, date = row
+        return chat_id, (decrypt(body) if body is not None else None), date
 
     async def prune_content(self) -> int:
         cutoff = int(time.time()) - settings.content_retention_hours * 3600

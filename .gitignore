@@ -4,6 +4,8 @@
 *.session-journal
 session_string.txt
 secret.key
+*.log
+login_debug.log
 
 # Data (deleted content lives here — do not commit)
 *.db
