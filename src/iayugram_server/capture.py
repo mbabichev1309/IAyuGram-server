@@ -149,6 +149,27 @@ class Capture:
             )
             log.info("captured %s media for msg %s (%d bytes, view_once=%s)",
                      kind, message.id, len(data), view_once)
+
+            if view_once:
+                # View-once media never fires MessageDeleted when consumed (that's a
+                # read-contents update, not a delete), so the client would never learn
+                # to materialize it. Since it WILL vanish and we already have the
+                # bytes, preserve it immediately: emit a synthetic DELETED now so the
+                # client inserts a permanent copy — before the original is even opened,
+                # so the sender is never notified. The client dedups deletes by
+                # message_id, so a later real delete can't duplicate it.
+                media = await store.get_media(chat_id, message.id)
+                caption = message.message or ""
+                date = int(message.date.timestamp())
+                cursor = await store.append_event(
+                    EventKind.DELETED, chat_id, message.id, caption, None, date
+                )
+                await self._publish(MessageEvent(
+                    cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
+                    message_id=message.id, text=caption, date=date,
+                    **_media_event_fields(media),
+                ))
+                log.info("view-once %s preserved immediately (msg %s)", kind, message.id)
         except Exception as e:  # noqa: BLE001 — must never break the capture stream
             log.warning("media capture failed for msg %s: %s",
                         getattr(message, "id", "?"), e)
