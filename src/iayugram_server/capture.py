@@ -66,27 +66,30 @@ class Capture:
             # Caveat #1: store content NOW; the delete update won't carry it.
             text = ev.message.message or ""
             await store.put_content(
-                ev.chat_id, ev.message.id, text, int(ev.message.date.timestamp())
+                ev.chat_id, ev.message.id, text,
+                int(ev.message.date.timestamp()), bool(ev.message.out),
             )
             if settings.media_capture:
                 await self._maybe_capture_media(ev.message, ev.chat_id)
 
         @self.client.on(events.MessageEdited)
         async def _on_edit(ev: events.MessageEdited.Event) -> None:
-            old_text, date = await store.get_content(ev.chat_id, ev.message.id)
+            old_text, date, _ = await store.get_content(ev.chat_id, ev.message.id)
             new_text = ev.message.message or ""
+            out = bool(ev.message.out)
             await store.put_content(
-                ev.chat_id, ev.message.id, new_text, int(ev.message.date.timestamp())
+                ev.chat_id, ev.message.id, new_text,
+                int(ev.message.date.timestamp()), out,
             )
             cursor = await store.append_event(
-                EventKind.EDITED, ev.chat_id, ev.message.id, new_text, old_text, date
+                EventKind.EDITED, ev.chat_id, ev.message.id, new_text, old_text, date, out
             )
             media = await store.get_media(ev.chat_id, ev.message.id)
             await self._publish(
                 MessageEvent(
                     cursor=cursor, kind=EventKind.EDITED, chat_id=ev.chat_id,
                     message_id=ev.message.id, text=new_text, old_text=old_text, date=date,
-                    **_media_event_fields(media),
+                    from_me=out, **_media_event_fields(media),
                 )
             )
 
@@ -101,18 +104,18 @@ class Capture:
             for mid in ev.deleted_ids:
                 if ev.chat_id:
                     chat_id = ev.chat_id
-                    text, date = await store.get_content(chat_id, mid)
+                    text, date, out = await store.get_content(chat_id, mid)
                 else:
-                    chat_id, text, date = await store.resolve_by_mid(mid)
+                    chat_id, text, date, out = await store.resolve_by_mid(mid)
                     chat_id = chat_id or 0
                 media = await store.get_media(chat_id, mid) if chat_id else None
                 cursor = await store.append_event(
-                    EventKind.DELETED, chat_id, mid, text, None, date
+                    EventKind.DELETED, chat_id, mid, text, None, date, out
                 )
                 await self._publish(
                     MessageEvent(
                         cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
-                        message_id=mid, text=text, date=date,
+                        message_id=mid, text=text, date=date, from_me=out,
                         **_media_event_fields(media),
                     )
                 )
@@ -163,12 +166,13 @@ class Capture:
                 media = await store.get_media(chat_id, message.id)
                 caption = message.message or ""
                 date = int(message.date.timestamp())
+                out = bool(message.out)
                 cursor = await store.append_event(
-                    EventKind.DELETED, chat_id, message.id, caption, None, date
+                    EventKind.DELETED, chat_id, message.id, caption, None, date, out
                 )
                 await self._publish(MessageEvent(
                     cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
-                    message_id=message.id, text=caption, date=date,
+                    message_id=message.id, text=caption, date=date, from_me=out,
                     **_media_event_fields(media),
                 ))
                 log.info("view-once %s preserved immediately (msg %s)", kind, message.id)
@@ -201,9 +205,9 @@ class Capture:
             log.warning("launch reconcile: capped at %d candidates — older stored "
                         "messages NOT checked this run", cap)
 
-        by_chat: dict[int, list[tuple[int, str | None, int | None]]] = defaultdict(list)
-        for chat_id, mid, text, date in candidates:
-            by_chat[chat_id].append((mid, text, date))
+        by_chat: dict[int, list[tuple[int, str | None, int | None, bool]]] = defaultdict(list)
+        for chat_id, mid, text, date, out in candidates:
+            by_chat[chat_id].append((mid, text, date, out))
 
         checked = recovered = skipped_chats = 0
         for chat_id, items in by_chat.items():
@@ -218,7 +222,7 @@ class Capture:
                 skipped_chats += 1
                 continue
 
-            info = {mid: (text, date) for mid, text, date in items}
+            info = {mid: (text, date, out) for mid, text, date, out in items}
             ids = list(info)
             for i in range(0, len(ids), 100):  # getMessages accepts <=100 ids
                 batch = ids[i:i + 100]
@@ -237,14 +241,14 @@ class Capture:
                         continue  # still exists
                     if await store.has_delete_event(chat_id, mid):
                         continue  # already recorded
-                    text, date = info[mid]
+                    text, date, out = info[mid]
                     media = await store.get_media(chat_id, mid)
                     cursor = await store.append_event(
-                        EventKind.DELETED, chat_id, mid, text, None, date
+                        EventKind.DELETED, chat_id, mid, text, None, date, out
                     )
                     await self._publish(MessageEvent(
                         cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
-                        message_id=mid, text=text, date=date,
+                        message_id=mid, text=text, date=date, from_me=out,
                         **_media_event_fields(media),
                     ))
                     recovered += 1

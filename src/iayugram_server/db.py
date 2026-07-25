@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS content (
     message_id  INTEGER NOT NULL,
     body        BLOB,               -- Fernet-encrypted text
     date        INTEGER,            -- original send date (unix s)
+    out         INTEGER NOT NULL DEFAULT 0,  -- 1 = sent by the account owner
     seen_at     INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
 );
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS events (
     body        BLOB,               -- Fernet-encrypted snapshot text
     old_body    BLOB,
     date        INTEGER,
+    out         INTEGER NOT NULL DEFAULT 0,  -- 1 = sent by the account owner
     created_at  INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS kv (
@@ -72,6 +74,14 @@ class Store:
         self._db = await aiosqlite.connect(self._path)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(_SCHEMA)
+        # Migration: add content.out to DBs created before it existed.
+        for table in ("content", "events"):
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN out INTEGER NOT NULL DEFAULT 0"
+                )
+            except Exception:  # noqa: BLE001 — column already exists
+                pass
         await self._db.commit()
 
     async def close(self) -> None:
@@ -84,49 +94,56 @@ class Store:
         return self._db
 
     # --- content store -----------------------------------------------------
-    async def put_content(self, chat_id: int, message_id: int, text: str, date: int) -> None:
+    async def put_content(
+        self, chat_id: int, message_id: int, text: str, date: int, out: bool = False
+    ) -> None:
         await self.db.execute(
-            "INSERT OR REPLACE INTO content(chat_id, message_id, body, date, seen_at) "
-            "VALUES (?,?,?,?,?)",
-            (chat_id, message_id, encrypt(text), date, int(time.time())),
+            "INSERT OR REPLACE INTO content(chat_id, message_id, body, date, out, seen_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (chat_id, message_id, encrypt(text), date, 1 if out else 0, int(time.time())),
         )
         await self.db.commit()
 
-    async def get_content(self, chat_id: int, message_id: int) -> tuple[str | None, int | None]:
+    async def get_content(
+        self, chat_id: int, message_id: int
+    ) -> tuple[str | None, int | None, bool]:
         async with self.db.execute(
-            "SELECT body, date FROM content WHERE chat_id=? AND message_id=?",
+            "SELECT body, date, out FROM content WHERE chat_id=? AND message_id=?",
             (chat_id, message_id),
         ) as cur:
             row = await cur.fetchone()
-        if not row or row[0] is None:
-            return None, (row[1] if row else None)
-        return decrypt(row[0]), row[1]
+        if not row:
+            return None, None, False
+        text = decrypt(row[0]) if row[0] is not None else None
+        return text, row[1], bool(row[2])
 
-    async def resolve_by_mid(self, message_id: int) -> tuple[int | None, str | None, int | None]:
+    async def resolve_by_mid(
+        self, message_id: int
+    ) -> tuple[int | None, str | None, int | None, bool]:
         """Look up content by message_id alone — for DM/cloud-chat deletes where
         Telethon can't give us chat_id (UpdateDeleteMessages carries only IDs, and
         non-channel message IDs are unique across all of a user's cloud dialogs).
-        Returns (chat_id, text, date) or (None, None, None) if unknown."""
+        Returns (chat_id, text, date, out) or (None, None, None, False) if unknown."""
         async with self.db.execute(
-            "SELECT chat_id, body, date FROM content WHERE message_id=? "
+            "SELECT chat_id, body, date, out FROM content WHERE message_id=? "
             "ORDER BY seen_at DESC LIMIT 1",
             (message_id,),
         ) as cur:
             row = await cur.fetchone()
         if not row:
-            return None, None, None
-        chat_id, body, date = row
-        return chat_id, (decrypt(body) if body is not None else None), date
+            return None, None, None, False
+        chat_id, body, date, out = row
+        return chat_id, (decrypt(body) if body is not None else None), date, bool(out)
 
     async def candidates_for_reconcile(
         self, limit: int
-    ) -> list[tuple[int, int, str | None, int | None]]:
+    ) -> list[tuple[int, int, str | None, int | None, bool]]:
         """Stored messages that have NO recorded delete yet — the set to verify
-        against the server on launch. Returns (chat_id, message_id, text, date),
+        against the server on launch. Returns (chat_id, message_id, text, date, out),
         newest first, capped at `limit`. A delete event may have been stored with
         chat_id=0 (DM limitation), so match on message_id OR the exact chat."""
         async with self.db.execute(
-            "SELECT c.chat_id, c.message_id, c.body, c.date "
+            "SELECT c.chat_id, c.message_id, c.body, c.date, c.out "
             "FROM content c "
             "WHERE NOT EXISTS ("
             "  SELECT 1 FROM events e "
@@ -138,7 +155,7 @@ class Store:
         ) as cur:
             rows = await cur.fetchall()
         return [
-            (r[0], r[1], decrypt(r[2]) if r[2] is not None else None, r[3])
+            (r[0], r[1], decrypt(r[2]) if r[2] is not None else None, r[3], bool(r[4]))
             for r in rows
         ]
 
@@ -235,10 +252,11 @@ class Store:
         text: str | None,
         old_text: str | None,
         date: int | None,
+        out: bool = False,
     ) -> int:
         cur = await self.db.execute(
-            "INSERT INTO events(kind, chat_id, message_id, body, old_body, date, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO events(kind, chat_id, message_id, body, old_body, date, out, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (
                 kind.value,
                 chat_id,
@@ -246,6 +264,7 @@ class Store:
                 encrypt(text) if text is not None else None,
                 encrypt(old_text) if old_text is not None else None,
                 date,
+                1 if out else 0,
                 int(time.time()),
             ),
         )
@@ -256,7 +275,7 @@ class Store:
         # LEFT JOIN media so replayed events carry media metadata too (derived from
         # the media table, not duplicated into events; gone if the media was pruned).
         async with self.db.execute(
-            "SELECT e.cursor, e.kind, e.chat_id, e.message_id, e.body, e.old_body, e.date, "
+            "SELECT e.cursor, e.kind, e.chat_id, e.message_id, e.body, e.old_body, e.date, e.out, "
             "       m.kind, m.mime, m.size, m.width, m.height, m.duration, m.view_once "
             "FROM events e "
             "LEFT JOIN media m ON m.chat_id = e.chat_id AND m.message_id = e.message_id "
@@ -273,13 +292,14 @@ class Store:
                 text=decrypt(r[4]) if r[4] is not None else None,
                 old_text=decrypt(r[5]) if r[5] is not None else None,
                 date=r[6],
-                media_kind=r[7],
-                media_mime=r[8],
-                media_size=r[9],
-                media_width=r[10],
-                media_height=r[11],
-                media_duration=r[12],
-                media_view_once=bool(r[13]) if r[13] is not None else False,
+                from_me=bool(r[7]),
+                media_kind=r[8],
+                media_mime=r[9],
+                media_size=r[10],
+                media_width=r[11],
+                media_height=r[12],
+                media_duration=r[13],
+                media_view_once=bool(r[14]) if r[14] is not None else False,
             )
             for r in rows
         ]
