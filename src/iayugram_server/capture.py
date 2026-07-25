@@ -49,6 +49,8 @@ class Capture:
         )
         # Live subscribers (WebSocket). Populated by the API layer.
         self.subscribers: set[asyncio.Queue[MessageEvent]] = set()
+        # Background launch-reconcile task (kept referenced so it isn't GC'd).
+        self._reconcile_task: asyncio.Task | None = None
 
     async def _publish(self, event: MessageEvent) -> None:
         for q in list(self.subscribers):
@@ -269,8 +271,24 @@ class Capture:
         except Exception as e:  # noqa: BLE001
             log.warning("get_dialogs (cache warm) failed: %s", e)
 
-        await self._reconcile_on_launch()
-        log.info("capture running; listening for deletes/edits")
+        # Run the launch reconcile in the BACKGROUND so live capture starts
+        # immediately. The scan does getMessages over up to reconcile_max_messages
+        # and can flood-wait for minutes; blocking on it would delay live deletes/
+        # media capture on every restart. It shares the client, yielding on its
+        # awaits/sleeps so the update stream keeps flowing.
+        self._reconcile_task = asyncio.create_task(self._reconcile_on_launch())
+
+        def _reconcile_done(task: asyncio.Task) -> None:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                log.warning("background reconcile failed: %s", e)
+
+        self._reconcile_task.add_done_callback(_reconcile_done)
+
+        log.info("capture running; listening for deletes/edits (reconcile in background)")
 
         while True:
             try:
