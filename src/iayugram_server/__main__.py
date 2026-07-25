@@ -17,6 +17,9 @@ async def _prune_loop() -> None:
         removed = await store.prune_content()
         if removed:
             logging.getLogger("prune").info("pruned %d stale content rows", removed)
+        removed_media = await store.prune_media()
+        if removed_media:
+            logging.getLogger("prune").info("pruned %d stale media files", removed_media)
         await asyncio.sleep(3600)
 
 

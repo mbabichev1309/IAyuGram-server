@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     db_path: str = "data/iayugram.db"
     content_retention_hours: int = 168
 
+    # Media capture (strategy A: download on receipt, filtered by type + size).
+    # v1 captures photos, voice notes and round video messages; view-once media
+    # is downloaded silently (download never sends a read/consumed update).
+    media_capture: bool = True
+    media_max_bytes: int = 20 * 1024 * 1024  # skip anything larger
+    media_dir: str = "data/media"            # encrypted media files live here
+    media_retention_hours: int = 720         # 30 days
+
     # On startup, verify stored messages still exist (getMessages by ID) and emit
     # synthetic DELETED events for any that vanished while the server was down.
     # StringSession does not persist Telethon's update pts across restarts, so
