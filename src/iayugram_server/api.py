@@ -9,6 +9,7 @@ import asyncio
 import logging
 
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .capture import capture
@@ -36,6 +37,19 @@ async def gap_sync(since: int = Query(0, ge=0), limit: int = Query(500, ge=1, le
     """Everything the client missed while offline, from its last cursor forward."""
     events = await store.events_after(since, limit)
     return GapSyncResponse(events=events, latest_cursor=await store.latest_cursor())
+
+
+@app.get("/media", dependencies=[Depends(_auth)])
+async def get_media(
+    chat_id: int = Query(...), message_id: int = Query(...)
+) -> Response:
+    """Serve the decrypted bytes of a captured media file. Query params (not path)
+    so negative chat_ids (channels/groups) work. TLS + token guard the transport."""
+    result = await store.read_media_bytes(chat_id, message_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="media not found")
+    data, mime = result
+    return Response(content=data, media_type=mime or "application/octet-stream")
 
 
 @app.websocket("/live")

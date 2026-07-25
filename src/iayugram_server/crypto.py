@@ -18,3 +18,12 @@ def encrypt(plaintext: str) -> bytes:
 
 def decrypt(token: bytes) -> str:
     return _f.decrypt(token).decode("utf-8")
+
+
+def encrypt_bytes(data: bytes) -> bytes:
+    """Encrypt raw media bytes at rest (same Fernet key as text)."""
+    return _f.encrypt(data)
+
+
+def decrypt_bytes(token: bytes) -> bytes:
+    return _f.decrypt(token)

@@ -20,9 +20,24 @@ from telethon.sessions import StringSession
 
 from .config import settings
 from .db import store
-from .models import EventKind, MessageEvent
+from .models import EventKind, MediaMeta, MessageEvent
 
 log = logging.getLogger("capture")
+
+
+def _media_event_fields(media: MediaMeta | None) -> dict:
+    """Flatten stored media metadata into MessageEvent's media_* fields."""
+    if media is None:
+        return {}
+    return {
+        "media_kind": media.kind,
+        "media_mime": media.mime,
+        "media_size": media.size,
+        "media_width": media.width,
+        "media_height": media.height,
+        "media_duration": media.duration,
+        "media_view_once": media.view_once,
+    }
 
 
 class Capture:
@@ -51,6 +66,8 @@ class Capture:
             await store.put_content(
                 ev.chat_id, ev.message.id, text, int(ev.message.date.timestamp())
             )
+            if settings.media_capture:
+                await self._maybe_capture_media(ev.message, ev.chat_id)
 
         @self.client.on(events.MessageEdited)
         async def _on_edit(ev: events.MessageEdited.Event) -> None:
@@ -62,10 +79,12 @@ class Capture:
             cursor = await store.append_event(
                 EventKind.EDITED, ev.chat_id, ev.message.id, new_text, old_text, date
             )
+            media = await store.get_media(ev.chat_id, ev.message.id)
             await self._publish(
                 MessageEvent(
                     cursor=cursor, kind=EventKind.EDITED, chat_id=ev.chat_id,
                     message_id=ev.message.id, text=new_text, old_text=old_text, date=date,
+                    **_media_event_fields(media),
                 )
             )
 
@@ -84,6 +103,7 @@ class Capture:
                 else:
                     chat_id, text, date = await store.resolve_by_mid(mid)
                     chat_id = chat_id or 0
+                media = await store.get_media(chat_id, mid) if chat_id else None
                 cursor = await store.append_event(
                     EventKind.DELETED, chat_id, mid, text, None, date
                 )
@@ -91,8 +111,47 @@ class Capture:
                     MessageEvent(
                         cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
                         message_id=mid, text=text, date=date,
+                        **_media_event_fields(media),
                     )
                 )
+
+    async def _maybe_capture_media(self, message, chat_id: int) -> None:
+        """Strategy A: download photo/voice/round bytes on receipt (filtered by
+        size), encrypt and store. Downloading never sends a read/consumed update,
+        so view-once media is grabbed silently before it's opened on the phone.
+        Wrapped so a media failure never breaks the capture stream."""
+        try:
+            if message.photo:
+                kind = "photo"
+            elif message.voice:
+                kind = "voice"
+            elif message.video_note:
+                kind = "round"
+            else:
+                return
+
+            f = message.file
+            size = getattr(f, "size", None)
+            if size is not None and size > settings.media_max_bytes:
+                log.info("media msg %s skipped: %s bytes > limit", message.id, size)
+                return
+
+            data = await message.download_media(file=bytes)
+            if not data:
+                return
+
+            view_once = getattr(message.media, "ttl_seconds", None) is not None
+            await store.put_media(
+                chat_id, message.id, kind,
+                getattr(f, "mime_type", None), len(data),
+                getattr(f, "width", None), getattr(f, "height", None),
+                getattr(f, "duration", None), view_once, data,
+            )
+            log.info("captured %s media for msg %s (%d bytes, view_once=%s)",
+                     kind, message.id, len(data), view_once)
+        except Exception as e:  # noqa: BLE001 — must never break the capture stream
+            log.warning("media capture failed for msg %s: %s",
+                        getattr(message, "id", "?"), e)
 
     async def _reconcile_on_launch(self) -> None:
         """Recover deletes missed while the server was down.
@@ -156,12 +215,14 @@ class Capture:
                     if await store.has_delete_event(chat_id, mid):
                         continue  # already recorded
                     text, date = info[mid]
+                    media = await store.get_media(chat_id, mid)
                     cursor = await store.append_event(
                         EventKind.DELETED, chat_id, mid, text, None, date
                     )
                     await self._publish(MessageEvent(
                         cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
                         message_id=mid, text=text, date=date,
+                        **_media_event_fields(media),
                     ))
                     recovered += 1
 

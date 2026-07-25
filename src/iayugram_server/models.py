@@ -16,6 +16,20 @@ class EventKind(str, Enum):
     EDITED = "edited"
 
 
+class MediaMeta(BaseModel):
+    """Metadata for a captured media file. `path` is server-internal (never sent
+    to the client) — the client fetches bytes from GET /media by chat+message id."""
+
+    kind: str  # 'photo' | 'voice' | 'round'
+    mime: str | None = None
+    size: int
+    width: int | None = None
+    height: int | None = None
+    duration: int | None = None
+    view_once: bool = False
+    path: str = ""
+
+
 class MessageEvent(BaseModel):
     """One append-only event in the log. `cursor` is monotonic per server."""
 
@@ -31,6 +45,16 @@ class MessageEvent(BaseModel):
     date: int | None = None
     # Prior text for edits, if we had it stored.
     old_text: str | None = None
+    # Media metadata (if the message carried captured photo/voice/round). The
+    # client fetches the bytes from GET /media?chat_id=..&message_id=.. . These
+    # are flattened (not a nested object) to keep the client's Codable simple.
+    media_kind: str | None = None
+    media_mime: str | None = None
+    media_size: int | None = None
+    media_width: int | None = None
+    media_height: int | None = None
+    media_duration: int | None = None
+    media_view_once: bool = False
 
 
 class GapSyncResponse(BaseModel):
