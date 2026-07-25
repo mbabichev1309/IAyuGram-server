@@ -45,6 +45,9 @@ class MessageEvent(BaseModel):
     date: int | None = None
     # Prior text for edits, if we had it stored.
     old_text: str | None = None
+    # True if the message was sent by the account owner (outgoing) — so the client
+    # renders the preserved copy on the correct side.
+    from_me: bool = False
     # Media metadata (if the message carried captured photo/voice/round). The
     # client fetches the bytes from GET /media?chat_id=..&message_id=.. . These
     # are flattened (not a nested object) to keep the client's Codable simple.
