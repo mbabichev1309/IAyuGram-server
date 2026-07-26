@@ -300,7 +300,7 @@ class Store:
                 media_size=r[10],
                 media_width=r[11],
                 media_height=r[12],
-                media_duration=r[13],
+                media_duration=int(r[13]) if r[13] is not None else None,
                 media_view_once=bool(r[14]) if r[14] is not None else False,
             )
             for r in rows
