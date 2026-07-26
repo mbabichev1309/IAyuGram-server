@@ -130,7 +130,9 @@ class Capture:
         so view-once media is grabbed silently before it's opened on the phone.
         Wrapped so a media failure never breaks the capture stream."""
         try:
-            if message.photo:
+            if message.sticker:
+                kind = "sticker"
+            elif message.photo:
                 kind = "photo"
             elif message.voice:
                 kind = "voice"
