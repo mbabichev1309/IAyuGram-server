@@ -212,7 +212,9 @@ class Store:
             return None
         return MediaMeta(
             kind=row[0], mime=row[1], size=row[2], width=row[3], height=row[4],
-            duration=row[5], view_once=bool(row[6]), path=row[7],
+            # duration may have been stored as a float (round/voice seconds).
+            duration=int(row[5]) if row[5] is not None else None,
+            view_once=bool(row[6]), path=row[7],
         )
 
     async def read_media_bytes(self, chat_id: int, message_id: int) -> tuple[bytes, str | None] | None:
