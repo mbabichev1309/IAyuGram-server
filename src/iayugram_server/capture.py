@@ -102,23 +102,27 @@ class Capture:
             # the text from the content store by message_id alone. Without this
             # the deleted text is lost — which defeats the whole feature.
             for mid in ev.deleted_ids:
-                if ev.chat_id:
-                    chat_id = ev.chat_id
-                    text, date, out = await store.get_content(chat_id, mid)
-                else:
-                    chat_id, text, date, out = await store.resolve_by_mid(mid)
-                    chat_id = chat_id or 0
-                media = await store.get_media(chat_id, mid) if chat_id else None
-                cursor = await store.append_event(
-                    EventKind.DELETED, chat_id, mid, text, None, date, out
-                )
-                await self._publish(
-                    MessageEvent(
-                        cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
-                        message_id=mid, text=text, date=date, from_me=out,
-                        **_media_event_fields(media),
+                # Guard each id so one bad message can't abort the whole delete batch.
+                try:
+                    if ev.chat_id:
+                        chat_id = ev.chat_id
+                        text, date, out = await store.get_content(chat_id, mid)
+                    else:
+                        chat_id, text, date, out = await store.resolve_by_mid(mid)
+                        chat_id = chat_id or 0
+                    media = await store.get_media(chat_id, mid) if chat_id else None
+                    cursor = await store.append_event(
+                        EventKind.DELETED, chat_id, mid, text, None, date, out
                     )
-                )
+                    await self._publish(
+                        MessageEvent(
+                            cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
+                            message_id=mid, text=text, date=date, from_me=out,
+                            **_media_event_fields(media),
+                        )
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("delete handler failed for msg %s: %s", mid, e)
 
     async def _maybe_capture_media(self, message, chat_id: int) -> None:
         """Strategy A: download photo/voice/round bytes on receipt (filtered by
@@ -146,11 +150,14 @@ class Capture:
                 return
 
             view_once = getattr(message.media, "ttl_seconds", None) is not None
+            # duration comes as a float (seconds) for round/voice — store as int.
+            raw_duration = getattr(f, "duration", None)
+            duration = int(raw_duration) if raw_duration is not None else None
             await store.put_media(
                 chat_id, message.id, kind,
                 getattr(f, "mime_type", None), len(data),
                 getattr(f, "width", None), getattr(f, "height", None),
-                getattr(f, "duration", None), view_once, data,
+                duration, view_once, data,
             )
             log.info("captured %s media for msg %s (%d bytes, view_once=%s)",
                      kind, message.id, len(data), view_once)
