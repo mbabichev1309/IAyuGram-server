@@ -25,10 +25,16 @@ class Settings(BaseSettings):
     content_retention_hours: int = 168
 
     # Media capture (strategy A: download on receipt, filtered by type + size).
-    # v1 captures photos, voice notes and round video messages; view-once media
-    # is downloaded silently (download never sends a read/consumed update).
+    # Captures photos, stickers, voice notes and round video, and — since phase 2 —
+    # video, animations, music and documents. View-once media is downloaded
+    # silently (download never sends a read/consumed update).
     media_capture: bool = True
-    media_max_bytes: int = 20 * 1024 * 1024  # skip anything larger
+    # Phase 2: media streams to disk and is encrypted chunk-by-chunk, so the limit
+    # is about disk and the client's willingness to download, not server RAM.
+    media_max_bytes: int = 512 * 1024 * 1024
+    # Plaintext bytes per encrypted frame; also the read granularity when serving a
+    # byte range. 1 MiB keeps per-request memory flat.
+    media_chunk_bytes: int = 1024 * 1024
     media_dir: str = "data/media"            # encrypted media files live here
     media_retention_hours: int = 720         # 30 days
 

@@ -20,7 +20,7 @@ class MediaMeta(BaseModel):
     """Metadata for a captured media file. `path` is server-internal (never sent
     to the client) — the client fetches bytes from GET /media by chat+message id."""
 
-    kind: str  # 'photo' | 'voice' | 'round'
+    kind: str  # photo|sticker|voice|round|video|gif|audio|document
     mime: str | None = None
     size: int
     width: int | None = None
@@ -28,6 +28,7 @@ class MediaMeta(BaseModel):
     duration: int | None = None
     view_once: bool = False
     path: str = ""
+    file_name: str | None = None  # original document name, when there is one
 
 
 class MessageEvent(BaseModel):
@@ -58,6 +59,7 @@ class MessageEvent(BaseModel):
     media_height: int | None = None
     media_duration: int | None = None
     media_view_once: bool = False
+    media_file_name: str | None = None
 
 
 class GapSyncResponse(BaseModel):

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import defaultdict
 
 from telethon import TelegramClient, events
@@ -37,6 +38,7 @@ def _media_event_fields(media: MediaMeta | None) -> dict:
         "media_height": media.height,
         "media_duration": media.duration,
         "media_view_once": media.view_once,
+        "media_file_name": media.file_name,
     }
 
 
@@ -124,45 +126,71 @@ class Capture:
                 except Exception as e:  # noqa: BLE001
                     log.warning("delete handler failed for msg %s: %s", mid, e)
 
+    @staticmethod
+    def _media_kind(message) -> str | None:
+        """Classify a message's media. Order matters: a sticker and a round video are
+        both documents, so the specific cases must come first."""
+        if message.sticker:
+            return "sticker"
+        if message.photo:
+            return "photo"
+        if message.voice:
+            return "voice"
+        if message.video_note:
+            return "round"
+        if message.gif:  # animation (silent looping mp4)
+            return "gif"
+        if message.video:
+            return "video"
+        if message.audio:  # music, as opposed to a voice note
+            return "audio"
+        if message.document:
+            return "document"
+        return None
+
     async def _maybe_capture_media(self, message, chat_id: int) -> None:
-        """Strategy A: download photo/voice/round bytes on receipt (filtered by
-        size), encrypt and store. Downloading never sends a read/consumed update,
-        so view-once media is grabbed silently before it's opened on the phone.
-        Wrapped so a media failure never breaks the capture stream."""
+        """Strategy A: download the media on receipt, encrypt and store it.
+        Downloading never sends a read/consumed update, so view-once media is
+        grabbed silently before it's opened on the phone. Wrapped so a media
+        failure never breaks the capture stream.
+
+        Phase 2: the file is streamed to a temp file and encrypted chunk-by-chunk,
+        so a large video costs disk rather than server memory."""
+        tmp_path: str | None = None
         try:
-            if message.sticker:
-                kind = "sticker"
-            elif message.photo:
-                kind = "photo"
-            elif message.voice:
-                kind = "voice"
-            elif message.video_note:
-                kind = "round"
-            else:
+            kind = self._media_kind(message)
+            if kind is None:
                 return
 
             f = message.file
             size = getattr(f, "size", None)
             if size is not None and size > settings.media_max_bytes:
-                log.info("media msg %s skipped: %s bytes > limit", message.id, size)
+                log.info("media msg %s (%s) skipped: %s bytes > limit",
+                         message.id, kind, size)
                 return
 
-            data = await message.download_media(file=bytes)
-            if not data:
+            os.makedirs(settings.media_dir, exist_ok=True)
+            tmp_path = os.path.join(
+                settings.media_dir, f".incoming_{chat_id}_{message.id}"
+            )
+            # Telethon streams to a path without buffering the whole file.
+            written = await message.download_media(file=tmp_path)
+            if not written or not os.path.exists(tmp_path):
                 return
 
             view_once = getattr(message.media, "ttl_seconds", None) is not None
             # duration comes as a float (seconds) for round/voice — store as int.
             raw_duration = getattr(f, "duration", None)
             duration = int(raw_duration) if raw_duration is not None else None
-            await store.put_media(
+            stored = await store.put_media_file(
                 chat_id, message.id, kind,
-                getattr(f, "mime_type", None), len(data),
+                getattr(f, "mime_type", None),
                 getattr(f, "width", None), getattr(f, "height", None),
-                duration, view_once, data,
+                duration, view_once, tmp_path,
+                file_name=getattr(f, "name", None),
             )
             log.info("captured %s media for msg %s (%d bytes, view_once=%s)",
-                     kind, message.id, len(data), view_once)
+                     kind, message.id, stored, view_once)
 
             if view_once:
                 # View-once media never fires MessageDeleted when consumed (that's a
@@ -188,6 +216,13 @@ class Capture:
         except Exception as e:  # noqa: BLE001 — must never break the capture stream
             log.warning("media capture failed for msg %s: %s",
                         getattr(message, "id", "?"), e)
+        finally:
+            # The plaintext temp file must never outlive the capture, even on failure.
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     async def _reconcile_on_launch(self) -> None:
         """Recover deletes missed while the server was down.
