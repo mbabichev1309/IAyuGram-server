@@ -170,8 +170,12 @@ class Capture:
                 return
 
             os.makedirs(settings.media_dir, exist_ok=True)
+            # The ".part" matters: Telethon appends the media's own extension when the
+            # name has none, so an extensionless temp lands somewhere we didn't name —
+            # and then a download that times out or throws leaks a PLAINTEXT file the
+            # cleanup below can't see. With an extension the name is kept as given.
             tmp_path = os.path.join(
-                settings.media_dir, f".incoming_{chat_id}_{message.id}"
+                settings.media_dir, f".incoming_{chat_id}_{message.id}.part"
             )
             # Telethon streams to a path without buffering the whole file.
             # A cross-DC download goes through a borrowed sender, which has been seen
@@ -188,9 +192,10 @@ class Capture:
                 log.warning("media download timed out after %ss: msg %s (%s, %s bytes)",
                             settings.media_download_timeout, message.id, kind, size)
                 return
-            # Telethon appends an extension when the given name has none, so the file
-            # is NOT at tmp_path — it returns where it actually wrote. Adopt that path,
-            # both to read it and so `finally` deletes the right (plaintext) file.
+            # Telethon returns where it actually wrote, which is not always the name we
+            # asked for: it appends an extension when there is none, and side-steps to
+            # "name (1).part" if our temp already exists. Adopt the returned path, both
+            # to read it and so `finally` deletes the right (plaintext) file.
             if isinstance(written, str):
                 tmp_path = written
             if not written or not os.path.exists(tmp_path):

@@ -96,12 +96,38 @@ async def live(ws: WebSocket) -> None:
     queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
     capture.subscribers.add(queue)
     log.info("live subscriber connected (%d total)", len(capture.subscribers))
-    try:
+
+    async def pump() -> None:
+        """Forward captured events to this subscriber."""
         while True:
             event = await queue.get()
             await ws.send_text(event.model_dump_json())
-    except WebSocketDisconnect:
-        pass
+
+    async def watch_peer() -> None:
+        """Read from the socket purely to notice when it goes away.
+
+        The client only ever sends WebSocket pings, which the protocol layer answers
+        by itself, so this never yields an application message — but without someone
+        awaiting receive(), a client's close frame is never observed. /live is silent
+        between events, so pump() may not write for hours and would not fail either:
+        the subscriber then leaks for the lifetime of the process (seen climbing to
+        11 dead sockets, whose failed writes were the endless socket.send() spam).
+        """
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+
+    tasks = {asyncio.create_task(pump()), asyncio.create_task(watch_peer())}
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            exc = task.exception()
+            if exc is not None and not isinstance(exc, WebSocketDisconnect):
+                log.warning("live subscriber ended with %r", exc)
     finally:
         capture.subscribers.discard(queue)
         log.info("live subscriber disconnected (%d left)", len(capture.subscribers))
