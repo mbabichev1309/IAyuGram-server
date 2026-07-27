@@ -188,6 +188,11 @@ class Capture:
                 log.warning("media download timed out after %ss: msg %s (%s, %s bytes)",
                             settings.media_download_timeout, message.id, kind, size)
                 return
+            # Telethon appends an extension when the given name has none, so the file
+            # is NOT at tmp_path — it returns where it actually wrote. Adopt that path,
+            # both to read it and so `finally` deletes the right (plaintext) file.
+            if isinstance(written, str):
+                tmp_path = written
             if not written or not os.path.exists(tmp_path):
                 log.warning("media download produced nothing: msg %s (%s) "
                             "returned=%r exists=%s",
