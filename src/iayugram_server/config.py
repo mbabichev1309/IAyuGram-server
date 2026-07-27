@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     media_chunk_bytes: int = 1024 * 1024
     media_dir: str = "data/media"            # encrypted media files live here
     media_retention_hours: int = 720         # 30 days
+    # Upper bound on a single download. A cross-DC transfer can stall indefinitely;
+    # without this the capture just loses the media and logs nothing.
+    media_download_timeout: int = 300
 
     # On startup, verify stored messages still exist (getMessages by ID) and emit
     # synthetic DELETED events for any that vanished while the server was down.

@@ -174,8 +174,24 @@ class Capture:
                 settings.media_dir, f".incoming_{chat_id}_{message.id}"
             )
             # Telethon streams to a path without buffering the whole file.
-            written = await message.download_media(file=tmp_path)
+            # A cross-DC download goes through a borrowed sender, which has been seen
+            # to connect and then never transfer anything — so it must be bounded, or
+            # the media is lost with nothing in the log to say why.
+            log.info("downloading %s media for msg %s (%s bytes) -> %s",
+                     kind, message.id, size, tmp_path)
+            try:
+                written = await asyncio.wait_for(
+                    message.download_media(file=tmp_path),
+                    timeout=settings.media_download_timeout,
+                )
+            except asyncio.TimeoutError:
+                log.warning("media download timed out after %ss: msg %s (%s, %s bytes)",
+                            settings.media_download_timeout, message.id, kind, size)
+                return
             if not written or not os.path.exists(tmp_path):
+                log.warning("media download produced nothing: msg %s (%s) "
+                            "returned=%r exists=%s",
+                            message.id, kind, written, os.path.exists(tmp_path))
                 return
 
             view_once = getattr(message.media, "ttl_seconds", None) is not None
