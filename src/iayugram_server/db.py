@@ -10,13 +10,14 @@ Three responsibilities, one file so a home-server backup is a single copy:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 
 import aiosqlite
 
 from .config import settings
-from .crypto import decrypt, decrypt_bytes, encrypt, encrypt_bytes
+from .crypto import decrypt, encrypt, encrypt_file
 from .models import EventKind, MediaMeta, MessageEvent
 
 _SCHEMA = """
@@ -47,15 +48,16 @@ CREATE TABLE IF NOT EXISTS kv (
 CREATE TABLE IF NOT EXISTS media (
     chat_id     INTEGER NOT NULL,
     message_id  INTEGER NOT NULL,
-    kind        TEXT NOT NULL,      -- 'photo' | 'voice' | 'round'
+    kind        TEXT NOT NULL,      -- photo|sticker|voice|round|video|gif|audio|document
     mime        TEXT,
     size        INTEGER NOT NULL,   -- plaintext byte size
     width       INTEGER,
     height      INTEGER,
     duration    INTEGER,
     view_once   INTEGER NOT NULL DEFAULT 0,
-    path        TEXT NOT NULL,      -- relative path of the Fernet-encrypted file
+    path        TEXT NOT NULL,      -- relative path of the encrypted file
     seen_at     INTEGER NOT NULL,
+    file_name   TEXT,               -- original document name, when there is one
     PRIMARY KEY (chat_id, message_id)
 );
 """
@@ -82,6 +84,11 @@ class Store:
                 )
             except Exception:  # noqa: BLE001 — column already exists
                 pass
+        # Migration: phase 2 records the original file name for documents.
+        try:
+            await self._db.execute("ALTER TABLE media ADD COLUMN file_name TEXT")
+        except Exception:  # noqa: BLE001 — column already exists
+            pass
         await self._db.commit()
 
     async def close(self) -> None:
@@ -174,37 +181,45 @@ class Store:
         return cur.rowcount
 
     # --- media store -------------------------------------------------------
-    async def put_media(
+    async def put_media_file(
         self,
         chat_id: int,
         message_id: int,
         kind: str,
         mime: str | None,
-        size: int,
         width: int | None,
         height: int | None,
         duration: int | None,
         view_once: bool,
-        data: bytes,
-    ) -> None:
+        src_path: str,
+        file_name: str | None = None,
+    ) -> int:
+        """Register media that was streamed to `src_path`, encrypting it into the
+        media dir chunk-by-chunk. Returns the plaintext size. Used for everything in
+        phase 2 — nothing is ever held whole in memory."""
         os.makedirs(settings.media_dir, exist_ok=True)
         rel = f"{chat_id}_{message_id}.enc"
         full = os.path.join(settings.media_dir, rel)
-        with open(full, "wb") as f:
-            f.write(encrypt_bytes(data))
+        size = await asyncio.to_thread(
+            encrypt_file, src_path, full, settings.media_chunk_bytes
+        )
         await self.db.execute(
             "INSERT OR REPLACE INTO media(chat_id, message_id, kind, mime, size, "
-            "width, height, duration, view_once, path, seen_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "width, height, duration, view_once, path, seen_at, file_name) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (chat_id, message_id, kind, mime, size, width, height, duration,
-             1 if view_once else 0, rel, int(time.time())),
+             1 if view_once else 0, rel, int(time.time()), file_name),
         )
         await self.db.commit()
+        return size
+
+    def media_full_path(self, meta: MediaMeta) -> str:
+        return os.path.join(settings.media_dir, meta.path)
 
     async def get_media(self, chat_id: int, message_id: int) -> MediaMeta | None:
         async with self.db.execute(
-            "SELECT kind, mime, size, width, height, duration, view_once, path "
-            "FROM media WHERE chat_id=? AND message_id=?",
+            "SELECT kind, mime, size, width, height, duration, view_once, path, "
+            "file_name FROM media WHERE chat_id=? AND message_id=?",
             (chat_id, message_id),
         ) as cur:
             row = await cur.fetchone()
@@ -214,21 +229,8 @@ class Store:
             kind=row[0], mime=row[1], size=row[2], width=row[3], height=row[4],
             # duration may have been stored as a float (round/voice seconds).
             duration=int(row[5]) if row[5] is not None else None,
-            view_once=bool(row[6]), path=row[7],
+            view_once=bool(row[6]), path=row[7], file_name=row[8],
         )
-
-    async def read_media_bytes(self, chat_id: int, message_id: int) -> tuple[bytes, str | None] | None:
-        """Decrypted media bytes + mime for the /media endpoint, or None."""
-        meta = await self.get_media(chat_id, message_id)
-        if meta is None:
-            return None
-        full = os.path.join(settings.media_dir, meta.path)
-        try:
-            with open(full, "rb") as f:
-                token = f.read()
-        except OSError:
-            return None
-        return decrypt_bytes(token), meta.mime
 
     async def prune_media(self) -> int:
         cutoff = int(time.time()) - settings.media_retention_hours * 3600
