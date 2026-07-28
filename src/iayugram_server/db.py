@@ -280,7 +280,8 @@ class Store:
         # the media table, not duplicated into events; gone if the media was pruned).
         async with self.db.execute(
             "SELECT e.cursor, e.kind, e.chat_id, e.message_id, e.body, e.old_body, e.date, e.out, "
-            "       m.kind, m.mime, m.size, m.width, m.height, m.duration, m.view_once "
+            "       m.kind, m.mime, m.size, m.width, m.height, m.duration, m.view_once, "
+            "       m.file_name "
             "FROM events e "
             "LEFT JOIN media m ON m.chat_id = e.chat_id AND m.message_id = e.message_id "
             "WHERE e.cursor > ? ORDER BY e.cursor ASC LIMIT ?",
@@ -304,6 +305,7 @@ class Store:
                 media_height=r[12],
                 media_duration=int(r[13]) if r[13] is not None else None,
                 media_view_once=bool(r[14]) if r[14] is not None else False,
+                media_file_name=r[15],
             )
             for r in rows
         ]

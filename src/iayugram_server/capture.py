@@ -53,6 +53,9 @@ class Capture:
         self.subscribers: set[asyncio.Queue[MessageEvent]] = set()
         # Background launch-reconcile task (kept referenced so it isn't GC'd).
         self._reconcile_task: asyncio.Task | None = None
+        # Media downloads still running, by (chat_id, message_id) — a delete that
+        # lands mid-download waits on these. See _await_inflight_media.
+        self._media_inflight: dict[tuple[int, int], asyncio.Task] = {}
 
     async def _publish(self, event: MessageEvent) -> None:
         for q in list(self.subscribers):
@@ -72,7 +75,7 @@ class Capture:
                 int(ev.message.date.timestamp()), bool(ev.message.out),
             )
             if settings.media_capture:
-                await self._maybe_capture_media(ev.message, ev.chat_id)
+                await self._capture_media_tracked(ev.message, ev.chat_id)
 
         @self.client.on(events.MessageEdited)
         async def _on_edit(ev: events.MessageEdited.Event) -> None:
@@ -112,6 +115,8 @@ class Capture:
                     else:
                         chat_id, text, date, out = await store.resolve_by_mid(mid)
                         chat_id = chat_id or 0
+                    if chat_id:
+                        await self._await_inflight_media(chat_id, mid)
                     media = await store.get_media(chat_id, mid) if chat_id else None
                     cursor = await store.append_event(
                         EventKind.DELETED, chat_id, mid, text, None, date, out
@@ -147,6 +152,43 @@ class Capture:
         if message.document:
             return "document"
         return None
+
+    async def _capture_media_tracked(self, message, chat_id: int) -> None:
+        """Run the capture as a tracked task, so a delete for this same message can
+        find and wait for the download instead of racing it."""
+        key = (chat_id, message.id)
+        task = asyncio.create_task(self._maybe_capture_media(message, chat_id))
+        self._media_inflight[key] = task
+        try:
+            await task
+        finally:
+            self._media_inflight.pop(key, None)
+
+    async def _await_inflight_media(self, chat_id: int, message_id: int) -> None:
+        """Wait for this message's media download, if one is still running.
+
+        A delete routinely lands mid-download: a 90 MB video takes far longer to
+        fetch than it takes to hit "delete". Publishing the delete then loses the
+        media metadata PERMANENTLY — the bytes do land moments later and gap-sync's
+        LEFT JOIN would replay a corrected event, but the client dedups deletes by
+        message_id and ignores it, leaving an empty bubble where the video was.
+        """
+        task = self._media_inflight.get((chat_id, message_id))
+        if task is None or task.done():
+            return
+        log.info("delete for msg %s arrived mid-download; waiting for the media",
+                 message_id)
+        try:
+            # shield: this waiter timing out must not cancel the download itself.
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=settings.media_download_timeout + 30
+            )
+        except asyncio.TimeoutError:
+            log.warning("media for msg %s not stored in time; publishing the delete "
+                        "without media metadata", message_id)
+        except Exception as e:  # noqa: BLE001 — never block the delete on this
+            log.warning("media capture for msg %s failed while a delete waited: %s",
+                        message_id, e)
 
     async def _maybe_capture_media(self, message, chat_id: int) -> None:
         """Strategy A: download the media on receipt, encrypt and store it.
