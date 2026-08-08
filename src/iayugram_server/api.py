@@ -34,8 +34,11 @@ def _auth(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+async def healthz() -> dict[str, object]:
+    # session_authorized is the field that matters: the process can be perfectly healthy
+    # while Telegram has revoked the companion session, in which case nothing is being
+    # captured at all. The client treats a false here as a hard warning.
+    return {"status": "ok", "session_authorized": capture.session_authorized}
 
 
 @app.get("/gap-sync", response_model=GapSyncResponse, dependencies=[Depends(_auth)])

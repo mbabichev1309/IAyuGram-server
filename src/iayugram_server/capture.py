@@ -56,6 +56,10 @@ class Capture:
         # Media downloads still running, by (chat_id, message_id) — a delete that
         # lands mid-download waits on these. See _await_inflight_media.
         self._media_inflight: dict[tuple[int, int], asyncio.Task] = {}
+        # Whether Telegram still accepts this session. Surfaced through /healthz so the
+        # phone can tell "server is down" from "server is up and capturing nothing" —
+        # the second looks healthy from outside and is the more dangerous of the two.
+        self.session_authorized = False
 
     async def _publish(self, event: MessageEvent) -> None:
         for q in list(self.subscribers):
@@ -371,10 +375,18 @@ class Capture:
     async def run(self) -> None:
         await self.client.connect()
         if not await self.client.is_user_authorized():
-            raise RuntimeError(
-                "Session not authorized. Regenerate it with "
+            # Deliberately NOT fatal. Raising here takes down the whole process (the
+            # entrypoint gathers this with uvicorn), systemd restarts it, and it dies
+            # the same way — a crash loop in which /healthz never answers, so the phone
+            # sees only "unreachable" and cannot tell that capture is the thing that
+            # broke. Stay up, serve the stored archive, and report the real reason.
+            log.error(
+                "Session not authorized — capture is DOWN. Regenerate it with "
                 "`python scripts/tdata_to_session.py` (see README)."
             )
+            self.session_authorized = False
+            return
+        self.session_authorized = True
         self._register_handlers()
         me = await self.client.get_me()
         log.info("capture authorized as id=%s", getattr(me, "id", "?"))
@@ -413,9 +425,12 @@ class Capture:
                 log.warning("FLOOD_WAIT: sleeping %ss", e.seconds)
                 await asyncio.sleep(e.seconds)
             except AuthKeyUnregisteredError:
-                # Session killed (likelier on datacenter IPs). Cannot self-heal.
+                # Session killed (likelier on datacenter IPs). Cannot self-heal — but
+                # stay up rather than crash-looping, so /healthz can tell the phone that
+                # the session is what died. See the note in the authorization check.
                 log.error("AUTH_KEY_UNREGISTERED — session revoked; re-run login.py")
-                raise
+                self.session_authorized = False
+                return
             else:
                 log.warning("disconnected; reconnecting")
                 await asyncio.sleep(3)
