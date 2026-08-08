@@ -49,6 +49,11 @@ class MessageEvent(BaseModel):
     # True if the message was sent by the account owner (outgoing) — so the client
     # renders the preserved copy on the correct side.
     from_me: bool = False
+    # Who actually sent it, as a marked peer id (Telethon's convention: positive for
+    # users, -100… for channels). from_me alone only says "mine or not", which is enough
+    # for a DM but leaves a group message with no author, so the client had to attribute
+    # it to the group itself. None for rows captured before this field existed.
+    sender_id: int | None = None
     # Media metadata (if the message carried captured photo/voice/round). The
     # client fetches the bytes from GET /media?chat_id=..&message_id=.. . These
     # are flattened (not a nested object) to keep the client's Codable simple.
