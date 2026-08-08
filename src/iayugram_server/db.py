@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS content (
     body        BLOB,               -- Fernet-encrypted text
     date        INTEGER,            -- original send date (unix s)
     out         INTEGER NOT NULL DEFAULT 0,  -- 1 = sent by the account owner
+    sender_id   INTEGER,            -- marked peer id of the sender (NULL if unknown)
     seen_at     INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
 );
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS events (
     old_body    BLOB,
     date        INTEGER,
     out         INTEGER NOT NULL DEFAULT 0,  -- 1 = sent by the account owner
+    sender_id   INTEGER,            -- marked peer id of the sender (NULL if unknown)
     created_at  INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS kv (
@@ -89,6 +91,15 @@ class Store:
             await self._db.execute("ALTER TABLE media ADD COLUMN file_name TEXT")
         except Exception:  # noqa: BLE001 — column already exists
             pass
+        # Migration: record who sent each message, so the client can attribute a
+        # preserved group message to its actual author instead of to the group. Rows
+        # captured before this stay NULL — their sender is not recoverable, since the
+        # original message is gone by the time anyone asks.
+        for table in ("content", "events"):
+            try:
+                await self._db.execute(f"ALTER TABLE {table} ADD COLUMN sender_id INTEGER")
+            except Exception:  # noqa: BLE001 — column already exists
+                pass
         await self._db.commit()
 
     async def close(self) -> None:
@@ -102,55 +113,75 @@ class Store:
 
     # --- content store -----------------------------------------------------
     async def put_content(
-        self, chat_id: int, message_id: int, text: str, date: int, out: bool = False
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        date: int,
+        out: bool = False,
+        sender_id: int | None = None,
     ) -> None:
         await self.db.execute(
-            "INSERT OR REPLACE INTO content(chat_id, message_id, body, date, out, seen_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (chat_id, message_id, encrypt(text), date, 1 if out else 0, int(time.time())),
+            "INSERT OR REPLACE INTO content(chat_id, message_id, body, date, out, sender_id, seen_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                chat_id,
+                message_id,
+                encrypt(text),
+                date,
+                1 if out else 0,
+                sender_id,
+                int(time.time()),
+            ),
         )
         await self.db.commit()
 
     async def get_content(
         self, chat_id: int, message_id: int
-    ) -> tuple[str | None, int | None, bool]:
+    ) -> tuple[str | None, int | None, bool, int | None]:
         async with self.db.execute(
-            "SELECT body, date, out FROM content WHERE chat_id=? AND message_id=?",
+            "SELECT body, date, out, sender_id FROM content WHERE chat_id=? AND message_id=?",
             (chat_id, message_id),
         ) as cur:
             row = await cur.fetchone()
         if not row:
-            return None, None, False
+            return None, None, False, None
         text = decrypt(row[0]) if row[0] is not None else None
-        return text, row[1], bool(row[2])
+        return text, row[1], bool(row[2]), row[3]
 
     async def resolve_by_mid(
         self, message_id: int
-    ) -> tuple[int | None, str | None, int | None, bool]:
+    ) -> tuple[int | None, str | None, int | None, bool, int | None]:
         """Look up content by message_id alone — for DM/cloud-chat deletes where
         Telethon can't give us chat_id (UpdateDeleteMessages carries only IDs, and
         non-channel message IDs are unique across all of a user's cloud dialogs).
-        Returns (chat_id, text, date, out) or (None, None, None, False) if unknown."""
+        Returns (chat_id, text, date, out, sender_id), or all-empty if unknown."""
         async with self.db.execute(
-            "SELECT chat_id, body, date, out FROM content WHERE message_id=? "
+            "SELECT chat_id, body, date, out, sender_id FROM content WHERE message_id=? "
             "ORDER BY seen_at DESC LIMIT 1",
             (message_id,),
         ) as cur:
             row = await cur.fetchone()
         if not row:
-            return None, None, None, False
-        chat_id, body, date, out = row
-        return chat_id, (decrypt(body) if body is not None else None), date, bool(out)
+            return None, None, None, False, None
+        chat_id, body, date, out, sender_id = row
+        return (
+            chat_id,
+            (decrypt(body) if body is not None else None),
+            date,
+            bool(out),
+            sender_id,
+        )
 
     async def candidates_for_reconcile(
         self, limit: int
-    ) -> list[tuple[int, int, str | None, int | None, bool]]:
+    ) -> list[tuple[int, int, str | None, int | None, bool, int | None]]:
         """Stored messages that have NO recorded delete yet — the set to verify
-        against the server on launch. Returns (chat_id, message_id, text, date, out),
-        newest first, capped at `limit`. A delete event may have been stored with
-        chat_id=0 (DM limitation), so match on message_id OR the exact chat."""
+        against the server on launch. Returns (chat_id, message_id, text, date, out,
+        sender_id), newest first, capped at `limit`. A delete event may have been stored
+        with chat_id=0 (DM limitation), so match on message_id OR the exact chat."""
         async with self.db.execute(
-            "SELECT c.chat_id, c.message_id, c.body, c.date, c.out "
+            "SELECT c.chat_id, c.message_id, c.body, c.date, c.out, c.sender_id "
             "FROM content c "
             "WHERE NOT EXISTS ("
             "  SELECT 1 FROM events e "
@@ -162,7 +193,7 @@ class Store:
         ) as cur:
             rows = await cur.fetchall()
         return [
-            (r[0], r[1], decrypt(r[2]) if r[2] is not None else None, r[3], bool(r[4]))
+            (r[0], r[1], decrypt(r[2]) if r[2] is not None else None, r[3], bool(r[4]), r[5])
             for r in rows
         ]
 
@@ -257,10 +288,11 @@ class Store:
         old_text: str | None,
         date: int | None,
         out: bool = False,
+        sender_id: int | None = None,
     ) -> int:
         cur = await self.db.execute(
-            "INSERT INTO events(kind, chat_id, message_id, body, old_body, date, out, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO events(kind, chat_id, message_id, body, old_body, date, out, sender_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 kind.value,
                 chat_id,
@@ -269,6 +301,7 @@ class Store:
                 encrypt(old_text) if old_text is not None else None,
                 date,
                 1 if out else 0,
+                sender_id,
                 int(time.time()),
             ),
         )
@@ -281,7 +314,7 @@ class Store:
         async with self.db.execute(
             "SELECT e.cursor, e.kind, e.chat_id, e.message_id, e.body, e.old_body, e.date, e.out, "
             "       m.kind, m.mime, m.size, m.width, m.height, m.duration, m.view_once, "
-            "       m.file_name "
+            "       m.file_name, e.sender_id "
             "FROM events e "
             "LEFT JOIN media m ON m.chat_id = e.chat_id AND m.message_id = e.message_id "
             "WHERE e.cursor > ? ORDER BY e.cursor ASC LIMIT ?",
@@ -306,6 +339,9 @@ class Store:
                 media_duration=int(r[13]) if r[13] is not None else None,
                 media_view_once=bool(r[14]) if r[14] is not None else False,
                 media_file_name=r[15],
+                # Appended at the end of the SELECT on purpose: inserting it next to the
+                # other event columns would shift every media index below it.
+                sender_id=r[16],
             )
             for r in rows
         ]
