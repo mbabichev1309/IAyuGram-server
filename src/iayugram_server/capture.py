@@ -143,6 +143,11 @@ class Capture:
             for mid in update.messages:
                 try:
                     chat_id, _, _, out, _ = await store.resolve_by_mid(mid)
+                    if not chat_id:
+                        # content is pruned after content_retention_hours (7 days), so a
+                        # message played long after it was sent has no row left to
+                        # resolve the chat from, and the mark would be dropped silently.
+                        chat_id, out = await self._resolve_peer_from_telegram(mid)
                     if not chat_id or not out:
                         continue
                     if await store.put_listened(chat_id, mid, listened_at):
@@ -182,6 +187,26 @@ class Capture:
                     )
                 except Exception as e:  # noqa: BLE001
                     log.warning("delete handler failed for msg %s: %s", mid, e)
+
+    async def _resolve_peer_from_telegram(self, message_id: int) -> tuple[int | None, bool]:
+        """Which chat a bare message id belongs to, and whether we sent it.
+
+        The fallback for when the content store has been pruned. messages.getMessages
+        accepts an id with no peer for non-channel messages — the same uniqueness the
+        delete path already leans on. Costs one API call, and only on a miss.
+        """
+        try:
+            message = await self.client.get_messages(None, ids=message_id)
+        except Exception as e:  # noqa: BLE001 — never let a lookup break the handler
+            log.warning("could not resolve peer for msg %s: %s", message_id, e)
+            return None, False
+        if message is None:
+            return None, False
+        # A deleted or otherwise unavailable message comes back as MessageEmpty, which
+        # has neither attribute.
+        chat_id = getattr(message, "chat_id", None)
+        out = bool(getattr(message, "out", False))
+        return chat_id, out
 
     @staticmethod
     def _media_kind(message) -> str | None:
