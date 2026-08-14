@@ -69,6 +69,24 @@ async def gap_sync(since: int = Query(0, ge=0), limit: int = Query(500, ge=1, le
     )
 
 
+@app.get("/listened", dependencies=[Depends(_auth)])
+async def get_listened(
+    chat_id: int = Query(...), message_id: int = Query(...)
+) -> dict[str, object]:
+    """When the recipient first played our own voice/round message.
+
+    Answered on demand rather than pushed through the event log: the client asks
+    exactly once, when the message's context menu is opened, so there is nothing to
+    stream and no client-side store to keep in sync. Query params (not a path) so
+    negative chat_ids work, same as /media.
+
+    listened_at is null when we never saw the update — including every message sent
+    before this was deployed. The client falls back to Telegram's own read date
+    there rather than claiming the message was never played.
+    """
+    return {"listened_at": await store.get_listened(chat_id, message_id)}
+
+
 @app.get("/media", dependencies=[Depends(_auth)])
 async def get_media(
     request: Request, chat_id: int = Query(...), message_id: int = Query(...)

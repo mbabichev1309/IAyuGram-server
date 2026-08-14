@@ -15,9 +15,12 @@ import logging
 import os
 from collections import defaultdict
 
+import time
+
 from telethon import TelegramClient, events
 from telethon.errors import AuthKeyUnregisteredError, FloodWaitError
 from telethon.sessions import StringSession
+from telethon.tl import types
 
 from .config import settings
 from .db import store
@@ -104,6 +107,37 @@ class Capture:
                     from_me=out, sender_id=sender_id, **_media_event_fields(media),
                 )
             )
+
+        @self.client.on(events.Raw(types.UpdateReadMessagesContents))
+        async def _on_contents_read(update: types.UpdateReadMessagesContents) -> None:
+            """The recipient played one of our voice/round messages.
+
+            This is the only signal that carries WHEN media was actually consumed.
+            Telegram's own messages.getOutboxReadDate answers a different question —
+            when the message was read — and for voice and round video that is not what
+            anyone means by "listened". The iOS client throws the timestamp away
+            entirely (ConsumableContentMessageAttribute stores one Bool), which is why
+            it has to be captured here.
+
+            The update carries message ids and no peer: non-channel ids are unique
+            across a user's cloud dialogs, so the chat is resolved from the content
+            store, the same way deletes already do it. `out` is what filters the two
+            directions apart — the same update fires when WE consume someone else's
+            media, and that is not interesting.
+
+            `date` is optional in the schema; falling back to now is honest here,
+            because the update is delivered as it happens on a live connection.
+            """
+            listened_at = int(getattr(update, "date", None) or time.time())
+            for mid in update.messages:
+                try:
+                    chat_id, _, _, out, _ = await store.resolve_by_mid(mid)
+                    if not chat_id or not out:
+                        continue
+                    if await store.put_listened(chat_id, mid, listened_at):
+                        log.info("listened: chat=%s message=%s at=%s", chat_id, mid, listened_at)
+                except Exception:  # noqa: BLE001 — one bad id must not drop the rest
+                    log.exception("failed to record listened mark for %s", mid)
 
         @self.client.on(events.MessageDeleted)
         async def _on_delete(ev: events.MessageDeleted.Event) -> None:

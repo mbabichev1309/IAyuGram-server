@@ -47,6 +47,18 @@ CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- When the recipient FIRST played one of our own voice/round messages. Telegram
+-- itself only exposes when a message was read (messages.getOutboxReadDate), which
+-- for other message types is a different fact and for these two is not the one the
+-- user wants. The signal is UpdateReadMessagesContents, whose timestamp nothing
+-- persists — the client's ConsumableContentMessageAttribute keeps a bare Bool.
+-- First only: INSERT OR IGNORE, never updated, so a replay cannot move the time.
+CREATE TABLE IF NOT EXISTS listened (
+    chat_id     INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    listened_at INTEGER NOT NULL,   -- unix seconds, from the update when it carries one
+    PRIMARY KEY (chat_id, message_id)
+);
 CREATE TABLE IF NOT EXISTS media (
     chat_id     INTEGER NOT NULL,
     message_id  INTEGER NOT NULL,
@@ -204,6 +216,26 @@ class Store:
             (message_id, chat_id),
         ) as cur:
             return await cur.fetchone() is not None
+
+    # --- listened marks -----------------------------------------------------
+    async def put_listened(self, chat_id: int, message_id: int, listened_at: int) -> bool:
+        """Record the FIRST time our own media message was played. Returns whether
+        this was new — OR IGNORE means a later update for the same message cannot
+        overwrite the original moment, which is the whole point of the feature."""
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO listened(chat_id, message_id, listened_at) VALUES (?,?,?)",
+            (chat_id, message_id, listened_at),
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def get_listened(self, chat_id: int, message_id: int) -> int | None:
+        async with self.db.execute(
+            "SELECT listened_at FROM listened WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else None
 
     async def prune_content(self) -> int:
         cutoff = int(time.time()) - settings.content_retention_hours * 3600
