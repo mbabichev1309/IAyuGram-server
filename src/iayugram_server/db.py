@@ -112,7 +112,37 @@ class Store:
                 await self._db.execute(f"ALTER TABLE {table} ADD COLUMN sender_id INTEGER")
             except Exception:  # noqa: BLE001 — column already exists
                 pass
+        # Indexes. Without them the launch reconcile is a nested full scan: its
+        # NOT EXISTS correlates content against events, and with no index on either
+        # side that is rows(content) x rows(events) comparisons — measured at 24k x
+        # 165k, which pinned a core for minutes on every single start. The API is
+        # unresponsive for that whole time (aiosqlite serializes on one worker
+        # thread) while redeploy.sh happily reports "healthy", because /healthz is
+        # the one endpoint that never touches the database.
+        #
+        # events(message_id, kind) serves that subquery; content(message_id) serves
+        # resolve_by_mid, which every delete and every consumed-media update calls,
+        # and which the composite primary key cannot answer because message_id is
+        # its second column. The seen_at pair is for the hourly prune.
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS idx_events_mid_kind ON events(message_id, kind)",
+            "CREATE INDEX IF NOT EXISTS idx_content_mid ON content(message_id)",
+            "CREATE INDEX IF NOT EXISTS idx_content_seen_at ON content(seen_at)",
+            "CREATE INDEX IF NOT EXISTS idx_media_seen_at ON media(seen_at)",
+        ):
+            await self._db.execute(statement)
         await self._db.commit()
+
+    async def checkpoint(self) -> None:
+        """Fold the WAL back into the database and truncate the file.
+
+        SQLite's automatic checkpoint is PASSIVE: it reuses the WAL from the start
+        but never shrinks it, so the file sits at its high-water mark — measured at
+        375 MiB against a 19 MB database. A clean close would collapse it, but the
+        service never gets one (uvicorn waits on the live WebSocket until systemd
+        SIGKILLs it), so it has to be done explicitly.
+        """
+        await self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     async def close(self) -> None:
         if self._db:

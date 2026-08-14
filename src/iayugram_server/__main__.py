@@ -20,6 +20,7 @@ async def _prune_loop() -> None:
         removed_media = await store.prune_media()
         if removed_media:
             logging.getLogger("prune").info("pruned %d stale media files", removed_media)
+        await store.checkpoint()
         await asyncio.sleep(3600)
 
 
@@ -29,7 +30,18 @@ async def _main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     await store.open()
-    config = uvicorn.Config(app, host=settings.host, port=settings.port, log_level="info")
+    # /live is a WebSocket that by design never closes on its own, so uvicorn's
+    # "waiting for connections to close" waits forever and systemd SIGKILLs the
+    # process 90s later. That is why the store's clean close never runs and the WAL
+    # is never collapsed — and why every restart is a hard kill rather than a
+    # shutdown. Give the wait a bound instead.
+    config = uvicorn.Config(
+        app,
+        host=settings.host,
+        port=settings.port,
+        log_level="info",
+        timeout_graceful_shutdown=5,
+    )
     server = uvicorn.Server(config)
     try:
         await asyncio.gather(
