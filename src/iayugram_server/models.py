@@ -72,3 +72,10 @@ class GapSyncResponse(BaseModel):
 
     events: list[MessageEvent]
     latest_cursor: int
+    # Free space on the volume holding captured media, so the client can warn before
+    # the disk fills and media starts failing to store. Deliberately the raw number
+    # rather than a "low" flag: the threshold then lives on the phone and can be
+    # changed without a deploy. None if the figure could not be read. Carried here
+    # because gap-sync is the one call the client makes unconditionally at launch and
+    # on every foreground — /healthz is only ever polled while the socket is down.
+    storage_free_bytes: int | None = None

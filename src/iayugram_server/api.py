@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 from urllib.parse import quote
 
 from fastapi import (
@@ -41,11 +42,31 @@ async def healthz() -> dict[str, object]:
     return {"status": "ok", "session_authorized": capture.session_authorized}
 
 
+def _storage_free_bytes() -> int | None:
+    """Free space on the volume that holds captured media.
+
+    Measured against media_dir rather than the process's cwd: that directory is what
+    fills, and it is the one that may sit on a different volume. Best effort — a
+    failure here must not take gap-sync down with it, since sync matters and the
+    warning does not.
+    """
+    try:
+        target = settings.media_dir if os.path.isdir(settings.media_dir) else "."
+        return shutil.disk_usage(target).free
+    except OSError:
+        log.warning("could not read free space for %s", settings.media_dir, exc_info=True)
+        return None
+
+
 @app.get("/gap-sync", response_model=GapSyncResponse, dependencies=[Depends(_auth)])
 async def gap_sync(since: int = Query(0, ge=0), limit: int = Query(500, ge=1, le=2000)) -> GapSyncResponse:
     """Everything the client missed while offline, from its last cursor forward."""
     events = await store.events_after(since, limit)
-    return GapSyncResponse(events=events, latest_cursor=await store.latest_cursor())
+    return GapSyncResponse(
+        events=events,
+        latest_cursor=await store.latest_cursor(),
+        storage_free_bytes=_storage_free_bytes(),
+    )
 
 
 @app.get("/media", dependencies=[Depends(_auth)])
