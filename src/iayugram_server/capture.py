@@ -16,6 +16,7 @@ import os
 from collections import defaultdict
 
 import time
+from datetime import datetime
 
 from telethon import TelegramClient, events
 from telethon.errors import AuthKeyUnregisteredError, FloodWaitError
@@ -128,7 +129,17 @@ class Capture:
             `date` is optional in the schema; falling back to now is honest here,
             because the update is delivered as it happens on a live connection.
             """
-            listened_at = int(getattr(update, "date", None) or time.time())
+            # Telethon hands `date` over already parsed into a datetime, not the raw TL
+            # int — int() on it raises, which took the whole handler down until this was
+            # caught in the journal. The field is also optional in the schema, and
+            # falling back to now is honest: the update is delivered as it happens.
+            raw_date = getattr(update, "date", None)
+            if isinstance(raw_date, datetime):
+                listened_at = int(raw_date.timestamp())
+            elif raw_date:
+                listened_at = int(raw_date)
+            else:
+                listened_at = int(time.time())
             for mid in update.messages:
                 try:
                     chat_id, _, _, out, _ = await store.resolve_by_mid(mid)
