@@ -89,15 +89,22 @@ async def get_listened(
 
 @app.get("/media", dependencies=[Depends(_auth)])
 async def get_media(
-    request: Request, chat_id: int = Query(...), message_id: int = Query(...)
+    request: Request,
+    chat_id: int = Query(...),
+    message_id: int = Query(...),
+    idx: int = Query(0, ge=0),
 ) -> Response:
     """Stream the decrypted bytes of a captured media file. Query params (not path)
     so negative chat_ids (channels/groups) work. TLS + token guard the transport.
 
     Phase 2: the response is streamed a chunk at a time and honours Range, so a
     large video neither loads into server memory nor has to be refetched from the
-    start when a transfer is interrupted."""
-    meta = await store.get_media(chat_id, message_id)
+    start when a transfer is interrupted.
+
+    `idx` picks a file within the message. It is 0 for everything except a purchased
+    paid post, which is a single message carrying an album; the event's media_items
+    lists which indices exist."""
+    meta = await store.get_media(chat_id, message_id, idx)
     if meta is None:
         raise HTTPException(status_code=404, detail="media not found")
 

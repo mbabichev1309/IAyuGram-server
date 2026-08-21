@@ -18,7 +18,7 @@ import aiosqlite
 
 from .config import settings
 from .crypto import decrypt, encrypt, encrypt_file
-from .models import EventKind, MediaMeta, MessageEvent
+from .models import EventKind, EventMediaItem, MediaMeta, MessageEvent
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS content (
@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS listened (
 CREATE TABLE IF NOT EXISTS media (
     chat_id     INTEGER NOT NULL,
     message_id  INTEGER NOT NULL,
+    idx         INTEGER NOT NULL DEFAULT 0,  -- position within the message (paid albums)
     kind        TEXT NOT NULL,      -- photo|sticker|voice|round|video|gif|audio|document
     mime        TEXT,
     size        INTEGER NOT NULL,   -- plaintext byte size
@@ -72,6 +73,18 @@ CREATE TABLE IF NOT EXISTS media (
     path        TEXT NOT NULL,      -- relative path of the encrypted file
     seen_at     INTEGER NOT NULL,
     file_name   TEXT,               -- original document name, when there is one
+    PRIMARY KEY (chat_id, message_id, idx)
+);
+-- Paid posts (messageMediaPaidMedia) seen while still locked. Before purchase the
+-- server sends only messageExtendedMediaPreview -- a blurred thumbnail with no file
+-- reference -- so there is nothing to capture yet. The row is the reminder to look
+-- again: unlocking arrives as UpdateMessageExtendedMedia, and a purchase made while
+-- this server was down produces no update at all, so the launch sweep re-checks
+-- these and drops the row once the media is stored (or the post is gone).
+CREATE TABLE IF NOT EXISTS paid_pending (
+    chat_id     INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    seen_at     INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
 );
 """
@@ -112,6 +125,42 @@ class Store:
                 await self._db.execute(f"ALTER TABLE {table} ADD COLUMN sender_id INTEGER")
             except Exception:  # noqa: BLE001 — column already exists
                 pass
+        # Migration: media is keyed by (chat, message, idx) since paid albums --
+        # one message, up to 10 files. sqlite cannot alter a primary key, so the
+        # table is rebuilt; existing rows are their message's only file, i.e. idx 0,
+        # and their encrypted files keep their names (idx 0 has no suffix).
+        async with self._db.execute("PRAGMA table_info(media)") as cur:
+            media_columns = {row[1] for row in await cur.fetchall()}
+        if media_columns and "idx" not in media_columns:
+            await self._db.executescript(
+                """
+                CREATE TABLE media_v2 (
+                    chat_id     INTEGER NOT NULL,
+                    message_id  INTEGER NOT NULL,
+                    idx         INTEGER NOT NULL DEFAULT 0,
+                    kind        TEXT NOT NULL,
+                    mime        TEXT,
+                    size        INTEGER NOT NULL,
+                    width       INTEGER,
+                    height      INTEGER,
+                    duration    INTEGER,
+                    view_once   INTEGER NOT NULL DEFAULT 0,
+                    path        TEXT NOT NULL,
+                    seen_at     INTEGER NOT NULL,
+                    file_name   TEXT,
+                    PRIMARY KEY (chat_id, message_id, idx)
+                );
+                INSERT INTO media_v2(chat_id, message_id, idx, kind, mime, size, width,
+                                     height, duration, view_once, path, seen_at, file_name)
+                SELECT chat_id, message_id, 0, kind, mime, size, width, height, duration,
+                       view_once, path, seen_at, file_name FROM media;
+                DROP TABLE media;
+                ALTER TABLE media_v2 RENAME TO media;
+                """
+            )
+            # The rebuild dropped the table's indexes with it; the loop below recreates
+            # them, which is why this has to run before it.
+
         # Indexes. Without them the launch reconcile is a nested full scan: its
         # NOT EXISTS correlates content against events, and with no index on either
         # side that is rows(content) x rows(events) comparisons — measured at 24k x
@@ -286,21 +335,26 @@ class Store:
         view_once: bool,
         src_path: str,
         file_name: str | None = None,
+        idx: int = 0,
     ) -> int:
         """Register media that was streamed to `src_path`, encrypting it into the
         media dir chunk-by-chunk. Returns the plaintext size. Used for everything in
-        phase 2 — nothing is ever held whole in memory."""
+        phase 2 — nothing is ever held whole in memory.
+
+        `idx` is the file's position in the message; only a purchased paid album ever
+        goes past 0. Item 0 keeps the historical file name, so media captured before
+        albums existed stays reachable."""
         os.makedirs(settings.media_dir, exist_ok=True)
-        rel = f"{chat_id}_{message_id}.enc"
+        rel = f"{chat_id}_{message_id}.enc" if idx == 0 else f"{chat_id}_{message_id}_{idx}.enc"
         full = os.path.join(settings.media_dir, rel)
         size = await asyncio.to_thread(
             encrypt_file, src_path, full, settings.media_chunk_bytes
         )
         await self.db.execute(
-            "INSERT OR REPLACE INTO media(chat_id, message_id, kind, mime, size, "
+            "INSERT OR REPLACE INTO media(chat_id, message_id, idx, kind, mime, size, "
             "width, height, duration, view_once, path, seen_at, file_name) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (chat_id, message_id, kind, mime, size, width, height, duration,
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (chat_id, message_id, idx, kind, mime, size, width, height, duration,
              1 if view_once else 0, rel, int(time.time()), file_name),
         )
         await self.db.commit()
@@ -309,21 +363,74 @@ class Store:
     def media_full_path(self, meta: MediaMeta) -> str:
         return os.path.join(settings.media_dir, meta.path)
 
-    async def get_media(self, chat_id: int, message_id: int) -> MediaMeta | None:
-        async with self.db.execute(
-            "SELECT kind, mime, size, width, height, duration, view_once, path, "
-            "file_name FROM media WHERE chat_id=? AND message_id=?",
-            (chat_id, message_id),
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            return None
+    _MEDIA_COLUMNS = (
+        "kind, mime, size, width, height, duration, view_once, path, file_name, idx"
+    )
+
+    @staticmethod
+    def _media_meta(row: tuple) -> MediaMeta:
         return MediaMeta(
             kind=row[0], mime=row[1], size=row[2], width=row[3], height=row[4],
             # duration may have been stored as a float (round/voice seconds).
             duration=int(row[5]) if row[5] is not None else None,
-            view_once=bool(row[6]), path=row[7], file_name=row[8],
+            view_once=bool(row[6]), path=row[7], file_name=row[8], idx=row[9],
         )
+
+    async def get_media(
+        self, chat_id: int, message_id: int, idx: int = 0
+    ) -> MediaMeta | None:
+        async with self.db.execute(
+            f"SELECT {self._MEDIA_COLUMNS} FROM media "
+            "WHERE chat_id=? AND message_id=? AND idx=?",
+            (chat_id, message_id, idx),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return self._media_meta(row)
+
+    async def get_media_items(self, chat_id: int, message_id: int) -> list[MediaMeta]:
+        """Every captured file of one message, in album order. One element for
+        ordinary media; several only for a purchased paid post."""
+        async with self.db.execute(
+            f"SELECT {self._MEDIA_COLUMNS} FROM media "
+            "WHERE chat_id=? AND message_id=? ORDER BY idx ASC",
+            (chat_id, message_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._media_meta(row) for row in rows]
+
+    # --- paid posts awaiting purchase --------------------------------------
+    async def put_paid_pending(self, chat_id: int, message_id: int) -> None:
+        await self.db.execute(
+            "INSERT OR IGNORE INTO paid_pending(chat_id, message_id, seen_at) VALUES (?,?,?)",
+            (chat_id, message_id, int(time.time())),
+        )
+        await self.db.commit()
+
+    async def drop_paid_pending(self, chat_id: int, message_id: int) -> None:
+        await self.db.execute(
+            "DELETE FROM paid_pending WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        )
+        await self.db.commit()
+
+    async def paid_pending_rows(self, limit: int) -> list[tuple[int, int]]:
+        """Locked paid posts to re-check, newest first."""
+        async with self.db.execute(
+            "SELECT chat_id, message_id FROM paid_pending ORDER BY seen_at DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            return [(row[0], row[1]) for row in await cur.fetchall()]
+
+    async def prune_paid_pending(self) -> int:
+        """Drop reminders older than the media retention window. A post bought that
+        long after it appeared is not what this table is for, and the sweep should not
+        keep re-checking it forever."""
+        cutoff = int(time.time()) - settings.media_retention_hours * 3600
+        cur = await self.db.execute("DELETE FROM paid_pending WHERE seen_at < ?", (cutoff,))
+        await self.db.commit()
+        return cur.rowcount
 
     async def prune_media(self) -> int:
         cutoff = int(time.time()) - settings.media_retention_hours * 3600
@@ -370,19 +477,59 @@ class Store:
         await self.db.commit()
         return cur.lastrowid  # type: ignore[return-value]
 
+    async def _extra_media_items(
+        self, pairs: set[tuple[int, int]]
+    ) -> dict[tuple[int, int], list[EventMediaItem]]:
+        """The 2nd..Nth files of the given messages, keyed by (chat, message).
+
+        Only a purchased paid album ever has any, so the common case is an empty dict
+        and one cheap query. Matching on the (chat_id, message_id) pair keeps the
+        media primary key usable as an index; a bare `message_id IN (…)` could not.
+        """
+        if not pairs:
+            return {}
+        placeholders = ",".join("(?,?)" for _ in pairs)
+        params: list[int] = []
+        for chat_id, message_id in pairs:
+            params.extend((chat_id, message_id))
+        async with self.db.execute(
+            f"SELECT chat_id, message_id, {self._MEDIA_COLUMNS} FROM media "
+            f"WHERE idx > 0 AND (chat_id, message_id) IN (VALUES {placeholders}) "
+            "ORDER BY idx ASC",
+            params,
+        ) as c:
+            rows = await c.fetchall()
+        extras: dict[tuple[int, int], list[EventMediaItem]] = {}
+        for row in rows:
+            meta = self._media_meta(row[2:])
+            extras.setdefault((row[0], row[1]), []).append(
+                EventMediaItem(
+                    idx=meta.idx, kind=meta.kind, mime=meta.mime, size=meta.size,
+                    width=meta.width, height=meta.height, duration=meta.duration,
+                    file_name=meta.file_name,
+                )
+            )
+        return extras
+
     async def events_after(self, cursor: int, limit: int = 500) -> list[MessageEvent]:
         # LEFT JOIN media so replayed events carry media metadata too (derived from
         # the media table, not duplicated into events; gone if the media was pruned).
+        # Pinned to idx 0: a message can now hold several files (paid album), and an
+        # unrestricted join would return the same event once per file.
         async with self.db.execute(
             "SELECT e.cursor, e.kind, e.chat_id, e.message_id, e.body, e.old_body, e.date, e.out, "
             "       m.kind, m.mime, m.size, m.width, m.height, m.duration, m.view_once, "
-            "       m.file_name, e.sender_id "
+            "       m.file_name, e.sender_id, m.idx "
             "FROM events e "
             "LEFT JOIN media m ON m.chat_id = e.chat_id AND m.message_id = e.message_id "
+            "                 AND m.idx = 0 "
             "WHERE e.cursor > ? ORDER BY e.cursor ASC LIMIT ?",
             (cursor, limit),
         ) as c:
             rows = await c.fetchall()
+        extras = await self._extra_media_items(
+            {(r[2], r[3]) for r in rows if r[8] is not None}
+        )
         return [
             MessageEvent(
                 cursor=r[0],
@@ -404,6 +551,19 @@ class Store:
                 # Appended at the end of the SELECT on purpose: inserting it next to the
                 # other event columns would shift every media index below it.
                 sender_id=r[16],
+                media_items=(
+                    [
+                        EventMediaItem(
+                            idx=0, kind=r[8], mime=r[9], size=r[10], width=r[11],
+                            height=r[12],
+                            duration=int(r[13]) if r[13] is not None else None,
+                            file_name=r[15],
+                        )
+                    ]
+                    + extras[(r[2], r[3])]
+                    if (r[2], r[3]) in extras and r[8] is not None
+                    else None
+                ),
             )
             for r in rows
         ]

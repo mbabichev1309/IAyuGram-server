@@ -48,5 +48,11 @@ class Settings(BaseSettings):
     reconcile_on_launch: bool = True
     reconcile_max_messages: int = 3000  # cap per launch to bound API load
 
+    # Paid ("stars") posts are captured only once the account has bought them: while
+    # locked, Telegram sends a blurred preview with no file reference. Those posts are
+    # remembered and re-checked at launch, which is how a purchase made while this
+    # server was down still gets captured. One refetch per post, so keep the cap low.
+    paid_recheck_max: int = 200
+
 
 settings = Settings()  # type: ignore[call-arg]

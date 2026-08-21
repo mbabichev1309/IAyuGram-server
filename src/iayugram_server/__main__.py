@@ -20,6 +20,11 @@ async def _prune_loop() -> None:
         removed_media = await store.prune_media()
         if removed_media:
             logging.getLogger("prune").info("pruned %d stale media files", removed_media)
+        removed_paid = await store.prune_paid_pending()
+        if removed_paid:
+            logging.getLogger("prune").info(
+                "dropped %d stale paid-post reminders", removed_paid
+            )
         await store.checkpoint()
         await asyncio.sleep(3600)
 

@@ -18,23 +18,32 @@ from collections import defaultdict
 import time
 from datetime import datetime
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.errors import AuthKeyUnregisteredError, FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl import types
+from telethon.tl.custom.file import File
 
 from .config import settings
 from .db import store
-from .models import EventKind, MediaMeta, MessageEvent
+from .models import EventKind, EventMediaItem, MediaMeta, MessageEvent
 
 log = logging.getLogger("capture")
 
 
-def _media_event_fields(media: MediaMeta | None) -> dict:
-    """Flatten stored media metadata into MessageEvent's media_* fields."""
+def _media_event_fields(
+    media: MediaMeta | None, items: list[MediaMeta] | None = None
+) -> dict:
+    """Flatten stored media metadata into MessageEvent's media_* fields.
+
+    `items` is every file of the message; it is carried separately only when there is
+    more than one, which today means a purchased paid album. The flattened fields stay
+    the first item either way, so a client that predates media_items shows the album's
+    first photo rather than nothing.
+    """
     if media is None:
         return {}
-    return {
+    fields: dict = {
         "media_kind": media.kind,
         "media_mime": media.mime,
         "media_size": media.size,
@@ -44,6 +53,16 @@ def _media_event_fields(media: MediaMeta | None) -> dict:
         "media_view_once": media.view_once,
         "media_file_name": media.file_name,
     }
+    if items and len(items) > 1:
+        fields["media_items"] = [
+            EventMediaItem(
+                idx=item.idx, kind=item.kind, mime=item.mime, size=item.size,
+                width=item.width, height=item.height, duration=item.duration,
+                file_name=item.file_name,
+            )
+            for item in items
+        ]
+    return fields
 
 
 class Capture:
@@ -57,6 +76,8 @@ class Capture:
         self.subscribers: set[asyncio.Queue[MessageEvent]] = set()
         # Background launch-reconcile task (kept referenced so it isn't GC'd).
         self._reconcile_task: asyncio.Task | None = None
+        # Same, for the launch re-check of paid posts that were locked when seen.
+        self._paid_sweep_task: asyncio.Task | None = None
         # Media downloads still running, by (chat_id, message_id) — a delete that
         # lands mid-download waits on these. See _await_inflight_media.
         self._media_inflight: dict[tuple[int, int], asyncio.Task] = {}
@@ -100,12 +121,12 @@ class Capture:
                 EventKind.EDITED, ev.chat_id, ev.message.id, new_text, old_text, date, out,
                 sender_id,
             )
-            media = await store.get_media(ev.chat_id, ev.message.id)
+            media_fields = await self._media_fields(ev.chat_id, ev.message.id)
             await self._publish(
                 MessageEvent(
                     cursor=cursor, kind=EventKind.EDITED, chat_id=ev.chat_id,
                     message_id=ev.message.id, text=new_text, old_text=old_text, date=date,
-                    from_me=out, sender_id=sender_id, **_media_event_fields(media),
+                    from_me=out, sender_id=sender_id, **media_fields,
                 )
             )
 
@@ -155,6 +176,46 @@ class Capture:
                 except Exception:  # noqa: BLE001 — one bad id must not drop the rest
                     log.exception("failed to record listened mark for %s", mid)
 
+        @self.client.on(events.Raw(types.UpdateMessageExtendedMedia))
+        async def _on_extended_media(update: types.UpdateMessageExtendedMedia) -> None:
+            """A paid post was just unlocked — this is the one moment its files exist.
+
+            Before purchase Telegram sends `messageExtendedMediaPreview`: width, height,
+            a blurred thumbnail and nothing else, so there is nothing to capture and no
+            way to fabricate it. The purchase happens on the phone, but it is recorded
+            against the ACCOUNT, so this session gets the update too and can then
+            download the real files. Missing this moment is not fatal — the launch sweep
+            re-checks paid_pending — but it is the only path that captures instantly.
+
+            The same update also carries bot-invoice extended media, hence the check
+            that something in it is actually unlocked before spending an API call.
+            """
+            if not settings.media_capture:
+                return
+            unlocked = any(
+                isinstance(item, types.MessageExtendedMedia)
+                for item in (update.extended_media or [])
+            )
+            if not unlocked:
+                return
+            try:
+                chat_id = utils.get_peer_id(update.peer)
+                message = await self.client.get_messages(update.peer, ids=update.msg_id)
+                if message is None or not getattr(message, "media", None):
+                    log.info("paid unlock for msg %s: message no longer available",
+                             update.msg_id)
+                    return
+                # The post may predate this server, or its content row may have been
+                # pruned; store it now so a later delete still has text and a date.
+                await store.put_content(
+                    chat_id, message.id, message.message or "",
+                    int(message.date.timestamp()), bool(message.out), message.sender_id,
+                )
+                log.info("paid post unlocked: chat=%s msg=%s", chat_id, message.id)
+                await self._capture_media_tracked(message, chat_id)
+            except Exception as e:  # noqa: BLE001 — never break the update stream
+                log.warning("paid unlock handling failed for msg %s: %s", update.msg_id, e)
+
         @self.client.on(events.MessageDeleted)
         async def _on_delete(ev: events.MessageDeleted.Event) -> None:
             # For DMs Telethon often can't resolve chat_id here (ev.chat_id is
@@ -174,7 +235,9 @@ class Capture:
                         chat_id = chat_id or 0
                     if chat_id:
                         await self._await_inflight_media(chat_id, mid)
-                    media = await store.get_media(chat_id, mid) if chat_id else None
+                    media_fields = (
+                        await self._media_fields(chat_id, mid) if chat_id else {}
+                    )
                     cursor = await store.append_event(
                         EventKind.DELETED, chat_id, mid, text, None, date, out, sender_id
                     )
@@ -182,7 +245,7 @@ class Capture:
                         MessageEvent(
                             cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
                             message_id=mid, text=text, date=date, from_me=out,
-                            sender_id=sender_id, **_media_event_fields(media),
+                            sender_id=sender_id, **media_fields,
                         )
                     )
                 except Exception as e:  # noqa: BLE001
@@ -229,6 +292,93 @@ class Capture:
         if message.document:
             return "document"
         return None
+
+    @staticmethod
+    def _paid_extended_media(message) -> list | None:
+        """The extended-media list of a paid ("stars") post, or None if the message is
+        not one.
+
+        Telethon does not unwrap MessageMediaPaidMedia at all — message.photo,
+        .video and .document all see straight past it — so _media_kind returns None
+        for a paid post and, before this existed, even a post the account had PAID for
+        was silently never captured.
+        """
+        media = getattr(message, "media", None)
+        if isinstance(media, types.MessageMediaPaidMedia):
+            return list(media.extended_media or [])
+        return None
+
+    @staticmethod
+    def _purchased_inner(item):
+        """The Photo/Document inside one paid-album item, or None while it is still
+        locked.
+
+        An unpurchased item is a `messageExtendedMediaPreview`: width, height, a
+        blurred thumbnail and a duration. No document, no photo, no file reference —
+        so there is literally nothing to download until the post is bought. That gate
+        is Telegram's, not a client flag, and nothing here can work around it.
+        """
+        if not isinstance(item, types.MessageExtendedMedia):
+            return None
+        inner = getattr(item, "media", None)
+        if isinstance(inner, types.MessageMediaPhoto) and isinstance(inner.photo, types.Photo):
+            return inner.photo
+        if isinstance(inner, types.MessageMediaDocument) and isinstance(
+            inner.document, types.Document
+        ):
+            return inner.document
+        return None
+
+    @staticmethod
+    def _raw_media_kind(inner) -> str:
+        """Classify a bare Photo/Document the way _media_kind classifies a message.
+
+        Same order and the same reason: a sticker and a round video are documents too.
+        Paid posts carry photos and videos in practice, but the rest costs nothing.
+        """
+        if isinstance(inner, types.Photo):
+            return "photo"
+        attributes = list(getattr(inner, "attributes", None) or [])
+
+        def attribute(cls):
+            return next((a for a in attributes if isinstance(a, cls)), None)
+
+        if attribute(types.DocumentAttributeSticker):
+            return "sticker"
+        audio = attribute(types.DocumentAttributeAudio)
+        if audio is not None and getattr(audio, "voice", False):
+            return "voice"
+        video = attribute(types.DocumentAttributeVideo)
+        if video is not None and getattr(video, "round_message", False):
+            return "round"
+        if attribute(types.DocumentAttributeAnimated):
+            return "gif"
+        if video is not None:
+            return "video"
+        if audio is not None:
+            return "audio"
+        return "document"
+
+    @staticmethod
+    async def _media_fields(chat_id: int, message_id: int) -> dict:
+        """The media_* fields for an event: the message's first file, plus the whole
+        album when it holds more than one (a purchased paid post)."""
+        items = await store.get_media_items(chat_id, message_id)
+        if not items:
+            return {}
+        return _media_event_fields(items[0], items)
+
+    @staticmethod
+    def _remove_temp(path: str | None) -> None:
+        """Delete a plaintext temp file. It must never outlive the capture — on any
+        path, including every failure."""
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
     async def _capture_media_tracked(self, message, chat_id: int) -> None:
         """Run the capture as a tracked task, so a delete for this same message can
@@ -277,6 +427,14 @@ class Capture:
         so a large video costs disk rather than server memory."""
         tmp_path: str | None = None
         try:
+            paid_items = self._paid_extended_media(message)
+            if paid_items is not None:
+                # A paid post is one message holding an album, so it needs its own
+                # loop and its own store rows — and, while it is still locked, nothing
+                # to download at all.
+                await self._capture_paid_media(message, chat_id, paid_items)
+                return
+
             kind = self._media_kind(message)
             if kind is None:
                 return
@@ -288,39 +446,10 @@ class Capture:
                          message.id, kind, size)
                 return
 
-            os.makedirs(settings.media_dir, exist_ok=True)
-            # The ".part" matters: Telethon appends the media's own extension when the
-            # name has none, so an extensionless temp lands somewhere we didn't name —
-            # and then a download that times out or throws leaks a PLAINTEXT file the
-            # cleanup below can't see. With an extension the name is kept as given.
-            tmp_path = os.path.join(
-                settings.media_dir, f".incoming_{chat_id}_{message.id}.part"
+            tmp_path = await self._download_to_temp(
+                message, chat_id, message.id, 0, kind, size
             )
-            # Telethon streams to a path without buffering the whole file.
-            # A cross-DC download goes through a borrowed sender, which has been seen
-            # to connect and then never transfer anything — so it must be bounded, or
-            # the media is lost with nothing in the log to say why.
-            log.info("downloading %s media for msg %s (%s bytes) -> %s",
-                     kind, message.id, size, tmp_path)
-            try:
-                written = await asyncio.wait_for(
-                    message.download_media(file=tmp_path),
-                    timeout=settings.media_download_timeout,
-                )
-            except asyncio.TimeoutError:
-                log.warning("media download timed out after %ss: msg %s (%s, %s bytes)",
-                            settings.media_download_timeout, message.id, kind, size)
-                return
-            # Telethon returns where it actually wrote, which is not always the name we
-            # asked for: it appends an extension when there is none, and side-steps to
-            # "name (1).part" if our temp already exists. Adopt the returned path, both
-            # to read it and so `finally` deletes the right (plaintext) file.
-            if isinstance(written, str):
-                tmp_path = written
-            if not written or not os.path.exists(tmp_path):
-                log.warning("media download produced nothing: msg %s (%s) "
-                            "returned=%r exists=%s",
-                            message.id, kind, written, os.path.exists(tmp_path))
+            if tmp_path is None:
                 return
 
             view_once = getattr(message.media, "ttl_seconds", None) is not None
@@ -345,7 +474,7 @@ class Capture:
                 # client inserts a permanent copy — before the original is even opened,
                 # so the sender is never notified. The client dedups deletes by
                 # message_id, so a later real delete can't duplicate it.
-                media = await store.get_media(chat_id, message.id)
+                media_fields = await self._media_fields(chat_id, message.id)
                 caption = message.message or ""
                 date = int(message.date.timestamp())
                 out = bool(message.out)
@@ -357,7 +486,7 @@ class Capture:
                 await self._publish(MessageEvent(
                     cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
                     message_id=message.id, text=caption, date=date, from_me=out,
-                    sender_id=sender_id, **_media_event_fields(media),
+                    sender_id=sender_id, **media_fields,
                 ))
                 log.info("view-once %s preserved immediately (msg %s)", kind, message.id)
         except Exception as e:  # noqa: BLE001 — must never break the capture stream
@@ -370,6 +499,168 @@ class Capture:
                     os.remove(tmp_path)
                 except OSError:
                     pass
+
+    async def _download_to_temp(
+        self, target, chat_id: int, message_id: int, idx: int, kind: str, size
+    ) -> str | None:
+        """Stream one media to a plaintext temp file and return where it actually
+        landed, or None — having cleaned up after itself — if nothing usable did.
+
+        `target` is the Message for ordinary media, or a bare Photo/Document for one
+        item of a purchased paid album; download_media accepts both.
+        """
+        os.makedirs(settings.media_dir, exist_ok=True)
+        # The ".part" matters: Telethon appends the media's own extension when the
+        # name has none, so an extensionless temp lands somewhere we didn't name —
+        # and then a download that times out or throws leaks a PLAINTEXT file the
+        # cleanup can't see. With an extension the name is kept as given.
+        suffix = "" if idx == 0 else f"_{idx}"
+        tmp_path = os.path.join(
+            settings.media_dir, f".incoming_{chat_id}_{message_id}{suffix}.part"
+        )
+        # Telethon streams to a path without buffering the whole file.
+        # A cross-DC download goes through a borrowed sender, which has been seen
+        # to connect and then never transfer anything — so it must be bounded, or
+        # the media is lost with nothing in the log to say why.
+        log.info("downloading %s media for msg %s[%d] (%s bytes) -> %s",
+                 kind, message_id, idx, size, tmp_path)
+        try:
+            written = await asyncio.wait_for(
+                self.client.download_media(target, file=tmp_path),
+                timeout=settings.media_download_timeout,
+            )
+        except asyncio.TimeoutError:
+            log.warning("media download timed out after %ss: msg %s[%d] (%s, %s bytes)",
+                        settings.media_download_timeout, message_id, idx, kind, size)
+            self._remove_temp(tmp_path)
+            return None
+        # Telethon returns where it actually wrote, which is not always the name we
+        # asked for: it appends an extension when there is none, and side-steps to
+        # "name (1).part" if our temp already exists. Adopt the returned path, both
+        # to read it and so the cleanup deletes the right (plaintext) file.
+        if isinstance(written, str):
+            tmp_path = written
+        if not written or not os.path.exists(tmp_path):
+            log.warning("media download produced nothing: msg %s[%d] (%s) "
+                        "returned=%r exists=%s",
+                        message_id, idx, kind, written, os.path.exists(tmp_path))
+            self._remove_temp(tmp_path)
+            return None
+        return tmp_path
+
+    async def _capture_paid_media(self, message, chat_id: int, items: list) -> None:
+        """Store the files of a paid post, one media row per album position.
+
+        Only what the account has PAID for can be stored: a locked item carries a
+        blurred preview and no file reference, so there is nothing to fetch and no
+        client-side trick that changes that. An unpurchased post is therefore only
+        remembered in paid_pending and looked at again when it unlocks — which is
+        what makes the bought post survive the channel deleting it later.
+        """
+        purchased: list[tuple[int, object]] = []
+        for idx, item in enumerate(items):
+            inner = self._purchased_inner(item)
+            if inner is not None:
+                purchased.append((idx, inner))
+
+        if not purchased:
+            await store.put_paid_pending(chat_id, message.id)
+            log.info("paid post msg %s is locked (%d items); remembered for re-check",
+                     message.id, len(items))
+            return
+
+        for idx, inner in purchased:
+            if await store.get_media(chat_id, message.id, idx) is not None:
+                continue  # already captured: a re-check, or a repeated unlock update
+            f = File(inner)
+            size = f.size
+            if size is not None and size > settings.media_max_bytes:
+                log.info("paid media msg %s[%d] skipped: %s bytes > limit",
+                         message.id, idx, size)
+                continue
+            kind = self._raw_media_kind(inner)
+            tmp_path = await self._download_to_temp(
+                inner, chat_id, message.id, idx, kind, size
+            )
+            if tmp_path is None:
+                continue
+            try:
+                raw_duration = f.duration
+                stored = await store.put_media_file(
+                    chat_id, message.id, kind, f.mime_type, f.width, f.height,
+                    int(raw_duration) if raw_duration is not None else None,
+                    False, tmp_path, file_name=f.name, idx=idx,
+                )
+                log.info("captured paid %s media for msg %s[%d] (%d bytes)",
+                         kind, message.id, idx, stored)
+            finally:
+                self._remove_temp(tmp_path)
+
+        if len(purchased) == len(items):
+            # Nothing in this post is locked any more, so there is nothing left to
+            # come back for. Items skipped for size stay skipped — the re-check exists
+            # to catch a purchase, not to retry a download the config refused.
+            await store.drop_paid_pending(chat_id, message.id)
+        else:
+            await store.put_paid_pending(chat_id, message.id)
+
+    async def _sweep_paid_pending(self) -> None:
+        """Re-check paid posts that were still locked when we saw them.
+
+        Covers the two cases the live unlock update cannot: a purchase made while this
+        server was down (StringSession persists no pts, so nothing is ever replayed),
+        and an update lost to a reconnect. Runs at launch beside the delete reconcile,
+        bounded by paid_recheck_max refetches.
+        """
+        if not settings.media_capture:
+            return
+        rows = await store.paid_pending_rows(settings.paid_recheck_max)
+        if not rows:
+            log.info("paid sweep: nothing pending")
+            return
+
+        by_chat: dict[int, list[int]] = defaultdict(list)
+        for chat_id, message_id in rows:
+            by_chat[chat_id].append(message_id)
+
+        checked = captured = 0
+        for chat_id, ids in by_chat.items():
+            try:
+                entity = await self.client.get_input_entity(chat_id)
+            except Exception as e:  # noqa: BLE001 — entity may be unresolvable
+                log.warning("paid sweep: can't resolve chat %s (%s); skipping %d posts",
+                            chat_id, e, len(ids))
+                continue
+            for i in range(0, len(ids), 100):  # getMessages accepts <=100 ids
+                batch = ids[i:i + 100]
+                try:
+                    messages = await self.client.get_messages(entity, ids=batch)
+                except FloodWaitError as e:
+                    log.warning("paid sweep FLOOD_WAIT %ss — stopping early "
+                                "(checked=%d captured=%d)", e.seconds, checked, captured)
+                    return
+                except Exception as e:  # noqa: BLE001
+                    log.warning("paid sweep getMessages failed for chat %s: %s", chat_id, e)
+                    break
+                for mid, message in zip(batch, messages):
+                    checked += 1
+                    try:
+                        paid_items = (
+                            self._paid_extended_media(message)
+                            if message is not None else None
+                        )
+                        if paid_items is None:
+                            # Deleted, or no longer a paid post: nothing to wait for.
+                            await store.drop_paid_pending(chat_id, mid)
+                            continue
+                        before = len(await store.get_media_items(chat_id, mid))
+                        await self._capture_paid_media(message, chat_id, paid_items)
+                        if len(await store.get_media_items(chat_id, mid)) > before:
+                            captured += 1
+                    except Exception as e:  # noqa: BLE001 — one post can't stop the sweep
+                        log.warning("paid sweep failed for msg %s: %s", mid, e)
+
+        log.info("paid sweep done: checked=%d newly_captured=%d", checked, captured)
 
     async def _reconcile_on_launch(self) -> None:
         """Recover deletes missed while the server was down.
@@ -436,14 +727,14 @@ class Capture:
                     if await store.has_delete_event(chat_id, mid):
                         continue  # already recorded
                     text, date, out, sender_id = info[mid]
-                    media = await store.get_media(chat_id, mid)
+                    media_fields = await self._media_fields(chat_id, mid)
                     cursor = await store.append_event(
                         EventKind.DELETED, chat_id, mid, text, None, date, out, sender_id
                     )
                     await self._publish(MessageEvent(
                         cursor=cursor, kind=EventKind.DELETED, chat_id=chat_id,
                         message_id=mid, text=text, date=date, from_me=out,
-                        sender_id=sender_id, **_media_event_fields(media),
+                        sender_id=sender_id, **media_fields,
                     ))
                     recovered += 1
 
@@ -493,6 +784,20 @@ class Capture:
                 log.warning("background reconcile failed: %s", e)
 
         self._reconcile_task.add_done_callback(_reconcile_done)
+
+        # Same treatment for the paid-post re-check: it refetches messages and can
+        # flood-wait, and live capture must not wait behind it.
+        self._paid_sweep_task = asyncio.create_task(self._sweep_paid_pending())
+
+        def _paid_sweep_done(task: asyncio.Task) -> None:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                log.warning("background paid sweep failed: %s", e)
+
+        self._paid_sweep_task.add_done_callback(_paid_sweep_done)
 
         log.info("capture running; listening for deletes/edits (reconcile in background)")
 

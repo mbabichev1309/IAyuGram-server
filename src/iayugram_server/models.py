@@ -18,9 +18,15 @@ class EventKind(str, Enum):
 
 class MediaMeta(BaseModel):
     """Metadata for a captured media file. `path` is server-internal (never sent
-    to the client) — the client fetches bytes from GET /media by chat+message id."""
+    to the client) — the client fetches bytes from GET /media by chat+message id.
+
+    `idx` is the position inside the message. Almost every message carries exactly
+    one file (idx 0), but a purchased paid post is a single message holding an album
+    of up to 10, so the store is keyed by (chat, message, idx) and the client asks
+    for a specific one with GET /media?...&idx=N."""
 
     kind: str  # photo|sticker|voice|round|video|gif|audio|document
+    idx: int = 0
     mime: str | None = None
     size: int
     width: int | None = None
@@ -29,6 +35,21 @@ class MediaMeta(BaseModel):
     view_once: bool = False
     path: str = ""
     file_name: str | None = None  # original document name, when there is one
+
+
+class EventMediaItem(BaseModel):
+    """One file of a multi-media message, as sent to the client. Same fields as the
+    flattened media_* set, minus the server-internal path — this is what a paid
+    album's 2nd..Nth items travel in."""
+
+    idx: int
+    kind: str
+    mime: str | None = None
+    size: int
+    width: int | None = None
+    height: int | None = None
+    duration: int | None = None
+    file_name: str | None = None
 
 
 class MessageEvent(BaseModel):
@@ -65,6 +86,11 @@ class MessageEvent(BaseModel):
     media_duration: int | None = None
     media_view_once: bool = False
     media_file_name: str | None = None
+    # Every file of the message, INCLUDING the one flattened above, present only when
+    # there is more than one — i.e. for a purchased paid album. The flattened fields
+    # stay the first item so a client that predates this renders the album's first
+    # photo instead of nothing.
+    media_items: list[EventMediaItem] | None = None
 
 
 class GapSyncResponse(BaseModel):
