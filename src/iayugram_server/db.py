@@ -175,6 +175,9 @@ class Store:
         # its second column. The seen_at pair is for the hourly prune.
         for statement in (
             "CREATE INDEX IF NOT EXISTS idx_events_mid_kind ON events(message_id, kind)",
+            # Replaying a time window (the client's forced re-sync) filters on
+            # created_at across the whole log, which is otherwise a full scan.
+            "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_content_mid ON content(message_id)",
             "CREATE INDEX IF NOT EXISTS idx_content_seen_at ON content(seen_at)",
             "CREATE INDEX IF NOT EXISTS idx_media_seen_at ON media(seen_at)",
@@ -511,7 +514,9 @@ class Store:
             )
         return extras
 
-    async def events_after(self, cursor: int, limit: int = 500) -> list[MessageEvent]:
+    async def events_after(
+        self, cursor: int, limit: int = 500, since_ts: int | None = None
+    ) -> list[MessageEvent]:
         # LEFT JOIN media so replayed events carry media metadata too (derived from
         # the media table, not duplicated into events; gone if the media was pruned).
         # Pinned to idx 0: a message can now hold several files (paid album), and an
@@ -523,8 +528,9 @@ class Store:
             "FROM events e "
             "LEFT JOIN media m ON m.chat_id = e.chat_id AND m.message_id = e.message_id "
             "                 AND m.idx = 0 "
-            "WHERE e.cursor > ? ORDER BY e.cursor ASC LIMIT ?",
-            (cursor, limit),
+            "WHERE e.cursor > ? AND (? IS NULL OR e.created_at >= ?) "
+            "ORDER BY e.cursor ASC LIMIT ?",
+            (cursor, since_ts, since_ts, limit),
         ) as c:
             rows = await c.fetchall()
         extras = await self._extra_media_items(

@@ -59,9 +59,20 @@ def _storage_free_bytes() -> int | None:
 
 
 @app.get("/gap-sync", response_model=GapSyncResponse, dependencies=[Depends(_auth)])
-async def gap_sync(since: int = Query(0, ge=0), limit: int = Query(500, ge=1, le=2000)) -> GapSyncResponse:
-    """Everything the client missed while offline, from its last cursor forward."""
-    events = await store.events_after(since, limit)
+async def gap_sync(
+    since: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=2000),
+    since_ts: int | None = Query(None, ge=0),
+) -> GapSyncResponse:
+    """Everything the client missed while offline, from its last cursor forward.
+
+    `since_ts` (unix seconds, capture time) additionally narrows the answer to a
+    window. That is what the client's forced re-sync asks for: it replays a recent
+    stretch of the log regardless of its cursor, for when an event was delivered but
+    never made it into the chat. Paging still runs on `since`, so a forced run walks
+    the window with cursor paging exactly like a normal catch-up.
+    """
+    events = await store.events_after(since, limit, since_ts)
     return GapSyncResponse(
         events=events,
         latest_cursor=await store.latest_cursor(),
